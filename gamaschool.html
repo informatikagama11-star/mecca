@@ -3922,36 +3922,21 @@
             }
         };
 
-        // Initialize Router on Window Load
+        // Saat aplikasi dibuka, tampilkan Beranda terlebih dahulu.
+        // Sesi admin yang tertinggal tidak boleh langsung membuka panel admin di komputer bersama.
+        // Siswa yang sedang mengerjakan ujian tetap dapat melanjutkan sesi setelah refresh.
         window.onload = async function() {
-            // Paksa Firebase Authentication memakai persistence LOCAL.
-            // Jadi login admin tetap tersimpan walaupun halaman/browser di-refresh.
             try {
                 await window.FB.setPersistence(window.auth, window.FB.browserLocalPersistence);
             } catch (e) {
                 console.warn('Persistence auth tidak dapat diatur:', e);
             }
 
+            let handlingAuthChange = false;
             window.auth.onAuthStateChanged(async (user) => {
-                // Jika admin masih login di Firebase, jangan lempar kembali ke halaman login/home.
-                // Pulihkan halaman admin terakhir yang sedang dibuka.
-                if (user && !localStorage.getItem('gamaSchoolActiveSession')) {
-                    let savedAdmin = null;
-                    try {
-                        savedAdmin = JSON.parse(localStorage.getItem('gamaSchoolAdminRoute') || 'null');
-                    } catch (e) {
-                        savedAdmin = null;
-                    }
+                if (handlingAuthChange) return;
 
-                    if (savedAdmin && savedAdmin.route && savedAdmin.route.startsWith('admin-') && savedAdmin.route !== 'admin-login') {
-                        router.navigate(savedAdmin.route, savedAdmin.params || {});
-                    } else {
-                        router.navigate('admin-dashboard');
-                    }
-                    return;
-                }
-
-                // Pulihkan pengerjaan siswa yang masih aktif setelah refresh.
+                // Pulihkan ujian siswa yang masih aktif terlebih dahulu.
                 const activeSessionId = localStorage.getItem('gamaSchoolActiveSession');
                 if (activeSessionId) {
                     try {
@@ -3961,11 +3946,28 @@
                             return;
                         }
                         localStorage.removeItem('gamaSchoolActiveSession');
-                    } catch(e) {
-                        console.error(e);
+                    } catch (e) {
+                        console.error('Gagal memulihkan sesi ujian:', e);
+                        // Jika pemeriksaan gagal, jangan membuka panel admin otomatis.
+                        router.navigate('home');
+                        return;
                     }
                 }
 
+                // Jika ada sesi Firebase yang tersimpan, keluarkan saat aplikasi dibuka ulang.
+                // Admin harus login kembali secara eksplisit dari tombol Admin Login.
+                if (user && !user.isAnonymous) {
+                    handlingAuthChange = true;
+                    try {
+                        await window.FB.signOut(window.auth);
+                    } catch (e) {
+                        console.warn('Tidak dapat mengakhiri sesi lama:', e);
+                    } finally {
+                        handlingAuthChange = false;
+                    }
+                }
+
+                localStorage.removeItem('gamaSchoolAdminRoute');
                 router.navigate('home');
             });
         };
