@@ -433,6 +433,7 @@
                             <h2 class="text-2xl font-bold text-slate-900">Masuk Ulangan</h2>
                             <p class="text-sm text-slate-500 mt-1">Masukkan NIS dan token yang diberikan guru.</p>
                         </div>
+                        <div id="student-upcoming-exams" class="hidden mb-5 p-4 rounded-xl border border-indigo-100 bg-indigo-50 text-sm text-indigo-900"></div>
                         <form id="student-login-form" class="space-y-5">
                             <div>
                                 <label class="block text-sm font-semibold text-slate-700 mb-2">NIS</label>
@@ -462,6 +463,23 @@
 
         async function initStudentLogin() {
             const form = document.getElementById('student-login-form');
+            const upcomingBox = document.getElementById('student-upcoming-exams');
+            if (upcomingBox) {
+                try {
+                    const snap = await window.FB.get(window.FB.ref(window.db, 'examSchedules'));
+                    const all = snap.exists() ? snap.val() : {};
+                    const now = Date.now();
+                    const upcoming = Object.values(all).filter(x => x.active !== false && new Date(x.endAt).getTime() >= now).sort((a,b) => new Date(a.startAt)-new Date(b.startAt)).slice(0,5);
+                    if (upcoming.length) {
+                        upcomingBox.classList.remove('hidden');
+                        upcomingBox.innerHTML = '<div class="font-bold mb-2">📅 Jadwal Ulangan</div>' + upcoming.map(x => {
+                            const start = new Date(x.startAt), diff = start.getTime()-now;
+                            const countdown = diff <= 0 ? 'Sedang berlangsung' : diff < 86400000 ? `Mulai ${Math.ceil(diff/3600000)} jam lagi` : `Mulai ${Math.ceil(diff/86400000)} hari lagi`;
+                            return `<div class="py-2 border-t border-indigo-100"><div class="font-semibold">${escapeHtml(x.title || 'Ulangan')} · ${escapeHtml(x.className || '-')}</div><div>${escapeHtml(x.startAt || '').replace('T',' ')} · ${escapeHtml(countdown)}</div></div>`;
+                        }).join('');
+                    }
+                } catch (e) { console.warn('Jadwal mendatang belum dapat dimuat', e); }
+            }
             form.addEventListener('submit', async (e) => {
                 e.preventDefault();
                 const nis = document.getElementById('student-nis').value.trim();
@@ -476,10 +494,21 @@
                     ]);
 
                     if (!studentSnap.exists()) throw new Error("Data siswa belum tersedia.");
-                    const settings = settingsSnap.exists() ? settingsSnap.val() : {};
-                    if (settings.examActive === false) throw new Error("Ulangan sedang tidak dibuka.");
-                    if (!settings.examToken || settings.examToken.toUpperCase() !== token) {
-                        throw new Error("Token ulangan salah atau sudah tidak berlaku.");
+                    let settings = settingsSnap.exists() ? settingsSnap.val() : {};
+                    const schedulesSnap = await window.FB.get(window.FB.ref(window.db, 'examSchedules'));
+                    const schedules = schedulesSnap.exists() ? schedulesSnap.val() : {};
+                    const matchedSchedule = Object.values(schedules).find(x => x.active !== false && String(x.token || '').toUpperCase() === token);
+                    if (matchedSchedule) {
+                        const now = Date.now(), start = new Date(matchedSchedule.startAt).getTime(), end = new Date(matchedSchedule.endAt).getTime();
+                        if (now < start) {
+                            const ms = start - now, days = Math.floor(ms / 86400000), hours = Math.floor((ms % 86400000) / 3600000), mins = Math.floor((ms % 3600000) / 60000);
+                            throw new Error(`Ulangan ${matchedSchedule.title || ''} untuk ${matchedSchedule.className} belum dimulai. Mulai ${new Date(start).toLocaleString('id-ID')}. Tersisa ${days ? days+' hari ' : ''}${hours} jam ${mins} menit.`);
+                        }
+                        if (now > end) throw new Error('Waktu sesi ulangan ini sudah berakhir.');
+                        settings = { ...settings, examTitle: matchedSchedule.title, examClassId: matchedSchedule.classId, examClassName: matchedSchedule.className, examChapter: matchedSchedule.chapter, examDuration: matchedSchedule.duration, examToken: matchedSchedule.token, examActive: true };
+                    } else {
+                        if (settings.examActive === false) throw new Error("Ulangan sedang tidak dibuka.");
+                        if (!settings.examToken || settings.examToken.toUpperCase() !== token) throw new Error("Token ulangan salah atau sudah tidak berlaku.");
                     }
 
                     const students = studentSnap.val();
@@ -3980,6 +4009,21 @@
                             </button>
                         </form>
                     </div>
+                    <div class="max-w-3xl mt-6 bg-white rounded-2xl border border-indigo-200 shadow-sm p-8">
+                        <h3 class="text-lg font-bold text-slate-900 mb-2">Jadwal Ulangan Banyak Kelas / Sesi</h3>
+                        <p class="text-sm text-slate-500 mb-5">Buat jadwal untuk tiap kelas dan sesi sekaligus. Token dibuat otomatis dan tersimpan per jadwal, jadi tidak perlu mengganti token setiap kali pindah kelas.</p>
+                        <form id="exam-schedule-form" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div class="md:col-span-2"><label class="block text-sm font-semibold mb-2">Judul Ulangan</label><input id="sched-title" required class="w-full px-4 py-3 rounded-xl border" placeholder="Contoh: Ulangan Sistem Komputer"></div>
+                            <div><label class="block text-sm font-semibold mb-2">Kelas</label><select id="sched-class" required class="w-full px-4 py-3 rounded-xl border"></select></div>
+                            <div><label class="block text-sm font-semibold mb-2">Bab</label><select id="sched-chapter" required class="w-full px-4 py-3 rounded-xl border"></select></div>
+                            <div><label class="block text-sm font-semibold mb-2">Mulai (tanggal & jam)</label><input id="sched-start" type="datetime-local" required class="w-full px-4 py-3 rounded-xl border"></div>
+                            <div><label class="block text-sm font-semibold mb-2">Selesai (tanggal & jam)</label><input id="sched-end" type="datetime-local" required class="w-full px-4 py-3 rounded-xl border"></div>
+                            <div><label class="block text-sm font-semibold mb-2">Durasi (menit)</label><input id="sched-duration" type="number" min="1" value="10" required class="w-full px-4 py-3 rounded-xl border"></div>
+                            <div class="flex items-center gap-2 pt-7"><input id="sched-active" type="checkbox" checked class="w-5 h-5"><label for="sched-active" class="font-semibold">Aktifkan jadwal</label></div>
+                            <button class="md:col-span-2 py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold" type="submit"><i class="fa-solid fa-calendar-plus mr-2"></i>Simpan Jadwal & Buat Token Otomatis</button>
+                        </form>
+                        <div class="mt-6"><h4 class="font-bold mb-3">Daftar Jadwal dan Token</h4><div id="exam-schedule-list" class="space-y-3 text-sm"><p class="text-slate-400">Memuat jadwal...</p></div></div>
+                    </div>
                 </div>
             `;
         }
@@ -4063,7 +4107,63 @@
                     window.showToast('Gagal menyimpan pengaturan: ' + err.message, 'error');
                 }
             });
+            await initExamSchedulePanel();
         }
+
+        async function initExamSchedulePanel() {
+            const form = document.getElementById('exam-schedule-form');
+            if (!form || form.dataset.bound === '1') return;
+            form.dataset.bound = '1';
+            const [classesSnap, questionsSnap] = await Promise.all([
+                window.FB.get(window.FB.ref(window.db, 'classes')),
+                window.FB.get(window.FB.ref(window.db, 'questions'))
+            ]);
+            const classes = uniqueActiveClasses(classesSnap.exists() ? classesSnap.val() : {});
+            const chapters = getChapterList(questionsSnap.exists() ? questionsSnap.val() : {});
+            document.getElementById('sched-class').innerHTML = classes.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name || c.id)}</option>`).join('') || '<option value="">Belum ada kelas</option>';
+            document.getElementById('sched-chapter').innerHTML = chapters.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('') || '<option value="">Belum ada bab</option>';
+            const refreshList = async () => {
+                const snap = await window.FB.get(window.FB.ref(window.db, 'examSchedules'));
+                const data = snap.exists() ? snap.val() : {};
+                const entries = Object.entries(data).sort((a,b) => String(a[1].startAt||'').localeCompare(String(b[1].startAt||'')));
+                const box = document.getElementById('exam-schedule-list');
+                if (!entries.length) { box.innerHTML = '<p class="text-slate-400">Belum ada jadwal sesi.</p>'; return; }
+                box.innerHTML = entries.map(([id,x]) => `<div class="p-4 rounded-xl border ${x.active ? 'border-indigo-100 bg-indigo-50' : 'border-slate-200 bg-slate-50'}"><div class="font-bold">${escapeHtml(x.title || 'Ulangan')} · ${escapeHtml(x.className || '-')}</div><div class="text-slate-600 mt-1">${escapeHtml(x.chapter || '-')} · ${escapeHtml(x.startAt || '-').replace('T',' ')} sampai ${escapeHtml(x.endAt || '-').replace('T',' ')}</div><div class="mt-2 flex flex-wrap items-center gap-2"><span class="px-3 py-1 bg-white rounded-lg border font-extrabold tracking-widest">${escapeHtml(x.token || '-')}</span><span class="text-xs ${x.active ? 'text-emerald-700' : 'text-slate-500'}">${x.active ? 'Aktif' : 'Nonaktif'}</span><button type="button" onclick="toggleExamSchedule('${id}',${!x.active})" class="px-3 py-1 rounded-lg border bg-white font-semibold">${x.active ? 'Nonaktifkan' : 'Aktifkan'}</button><button type="button" onclick="deleteExamSchedule('${id}')" class="px-3 py-1 rounded-lg border border-rose-200 text-rose-700 bg-white font-semibold">Hapus</button></div></div>`).join('');
+            };
+            form.addEventListener('submit', async e => {
+                e.preventDefault();
+                const classId = document.getElementById('sched-class').value;
+                const className = document.getElementById('sched-class').selectedOptions[0]?.textContent || '';
+                const chapter = document.getElementById('sched-chapter').value;
+                const startAt = document.getElementById('sched-start').value;
+                const endAt = document.getElementById('sched-end').value;
+                if (!classId || !chapter) return window.showToast('Pilih kelas dan bab terlebih dahulu.', 'error');
+                if (!startAt || !endAt || new Date(endAt) <= new Date(startAt)) return window.showToast('Waktu selesai harus setelah waktu mulai.', 'error');
+                const qSnap = await window.FB.get(window.FB.ref(window.db, 'questions'));
+                const qs = qSnap.exists() ? qSnap.val() : {};
+                if (!Object.values(qs).some(q => q.active !== false && getQuestionChapter(q) === chapter)) return window.showToast('Belum ada soal aktif untuk bab tersebut.', 'error');
+                const token = 'GAMA' + Math.floor(100000 + Math.random() * 900000);
+                const id = 'schedule_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+                const schedule = { title: document.getElementById('sched-title').value.trim(), classId, className, chapter, startAt, endAt, duration: parseInt(document.getElementById('sched-duration').value,10)||10, token, active: document.getElementById('sched-active').checked, createdAt: new Date().toISOString() };
+                await window.FB.set(window.FB.ref(window.db, 'examSchedules/' + id), schedule);
+                window.showToast('Jadwal tersimpan dan token dibuat otomatis.', 'success');
+                form.reset(); document.getElementById('sched-duration').value = 10; document.getElementById('sched-active').checked = true;
+                await refreshList();
+            });
+            window.refreshExamScheduleList = refreshList;
+            await refreshList();
+        }
+        window.toggleExamSchedule = async function(id, active) {
+            await window.FB.update(window.FB.ref(window.db, 'examSchedules/' + id), {active});
+            await window.refreshExamScheduleList?.();
+            window.showToast(active ? 'Jadwal diaktifkan.' : 'Jadwal dinonaktifkan.', 'success');
+        };
+        window.deleteExamSchedule = async function(id) {
+            if (!confirm('Hapus jadwal ini?')) return;
+            await window.FB.set(window.FB.ref(window.db, 'examSchedules/' + id), null);
+            await window.refreshExamScheduleList?.();
+            window.showToast('Jadwal dihapus.', 'success');
+        };
 
         window.generateExamToken = async function() {
             const token = 'GAMA' + Math.floor(1000 + Math.random() * 9000);
