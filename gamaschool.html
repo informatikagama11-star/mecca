@@ -224,6 +224,7 @@
             currentRoute: 'home',
             params: {},
             navigate(route, params = {}) {
+                if (this.currentRoute === 'exam' && route !== 'exam') stopExamIntegrityMonitoring();
                 this.currentRoute = route;
                 this.params = params;
                 // Simpan halaman admin terakhir agar saat browser di-refresh,
@@ -327,6 +328,10 @@
                     case 'admin-exam-status':
                         container.innerHTML = renderAdminExamStatusView();
                         initAdminExamStatus();
+                        break;
+                    case 'admin-integrity':
+                        container.innerHTML = renderAdminIntegrityView();
+                        initAdminIntegrity();
                         break;
                     case 'admin-result-detail':
                         container.innerHTML = renderAdminResultDetailView(this.params);
@@ -800,6 +805,88 @@
             timerInterval: null
         };
 
+
+        // Pengawasan ujian: catat indikasi, bukan bukti pasti kecurangan.
+        let examIntegrityHandlers = null;
+        let examIntegrityCount = 0;
+        let examIntegrityLastEventAt = 0;
+        let examIntegritySessionId = null;
+
+        async function setupExamIntegrityMonitoring(sessData) {
+            stopExamIntegrityMonitoring();
+            if (router.currentRoute !== 'exam' || !currentExamState.sessionId) return;
+            examIntegritySessionId = currentExamState.sessionId;
+            examIntegrityCount = 0;
+            examIntegrityLastEventAt = 0;
+            try {
+                const oldSnap = await window.FB.get(window.FB.ref(window.db, `examSessions/${examIntegritySessionId}/integrityEvents`));
+                if (oldSnap.exists()) examIntegrityCount = Object.keys(oldSnap.val() || {}).length;
+            } catch (e) { console.warn('Tidak dapat membaca catatan pengawasan lama:', e); }
+            if (router.currentRoute !== 'exam' || examIntegritySessionId !== currentExamState.sessionId) return;
+
+            const logIntegrityEvent = async (type, detail) => {
+                if (router.currentRoute !== 'exam' || !examIntegritySessionId || examIntegritySessionId !== currentExamState.sessionId) return;
+                const now = Date.now();
+                // Hindari duplikasi event yang terpicu berdekatan.
+                if (now - examIntegrityLastEventAt < 700) return;
+                examIntegrityLastEventAt = now;
+                examIntegrityCount += 1;
+                const event = {
+                    type,
+                    detail: detail || '',
+                    timestamp: now,
+                    studentId: currentExamState.studentId || '',
+                    studentName: sessData.studentName || '',
+                    nis: sessData.nis || '',
+                    className: sessData.className || '',
+                    examTitle: sessData.examTitle || '',
+                    count: examIntegrityCount
+                };
+                try {
+                    const eventRef = window.FB.push(window.FB.ref(window.db, `examSessions/${examIntegritySessionId}/integrityEvents`));
+                    await window.FB.set(eventRef, event);
+                } catch (err) {
+                    console.warn('Catatan pengawasan tidak berhasil disimpan:', err);
+                }
+                let message;
+                if (examIntegrityCount === 1) message = `Peringatan 1: aktivitas di luar halaman ujian terdeteksi dan dicatat.`;
+                else if (examIntegrityCount === 2) message = `Peringatan 2: aktivitas serupa kembali terdeteksi. Catatan tersimpan.`;
+                else message = `Perhatian: aktivitas ke-${examIntegrityCount} tercatat. Guru dapat meninjau aktivitas ini.`;
+                window.showToast(message, 'warning');
+            };
+
+            const onVisibilityChange = () => {
+                if (document.visibilityState === 'hidden') logIntegrityEvent('tab_hidden', 'Berpindah tab atau meminimalkan browser');
+            };
+            const onClipboardAttempt = (event) => {
+                event.preventDefault();
+                const labels = { copy: 'menyalin teks', cut: 'memotong teks', paste: 'menempelkan teks' };
+                logIntegrityEvent('clipboard_' + event.type, labels[event.type] || event.type);
+            };
+            const onContextMenu = (event) => {
+                event.preventDefault();
+                logIntegrityEvent('context_menu', 'Mencoba membuka menu klik kanan');
+            };
+            document.addEventListener('visibilitychange', onVisibilityChange);
+            document.addEventListener('copy', onClipboardAttempt, true);
+            document.addEventListener('cut', onClipboardAttempt, true);
+            document.addEventListener('paste', onClipboardAttempt, true);
+            document.addEventListener('contextmenu', onContextMenu, true);
+            examIntegrityHandlers = { onVisibilityChange, onClipboardAttempt, onContextMenu };
+        }
+
+        function stopExamIntegrityMonitoring() {
+            if (examIntegrityHandlers) {
+                document.removeEventListener('visibilitychange', examIntegrityHandlers.onVisibilityChange);
+                document.removeEventListener('copy', examIntegrityHandlers.onClipboardAttempt, true);
+                document.removeEventListener('cut', examIntegrityHandlers.onClipboardAttempt, true);
+                document.removeEventListener('paste', examIntegrityHandlers.onClipboardAttempt, true);
+                document.removeEventListener('contextmenu', examIntegrityHandlers.onContextMenu, true);
+            }
+            examIntegrityHandlers = null;
+            examIntegritySessionId = null;
+        }
+
         async function initExamSession(params) {
             currentExamState.sessionId = params.sessionId;
             currentExamState.studentId = params.studentId;
@@ -822,6 +909,7 @@
                     return;
                 }
 
+                setupExamIntegrityMonitoring(sessData);
                 document.getElementById('exam-student-name').innerText = sessData.examTitle || 'Ulangan Online';
                 document.getElementById('exam-student-class').innerText = `${sessData.studentName} • Kelas: ${sessData.className} • NIS: ${sessData.nis}`;
                 const chapterEl = document.getElementById('exam-chapter-name');
@@ -1413,6 +1501,7 @@
                         <button onclick="router.navigate('admin-games')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'games' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-gamepad mr-1.5"></i> Games</button>
                         <button onclick="router.navigate('admin-results')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'results' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-square-poll-vertical mr-1.5"></i> Hasil Ujian</button>
                         <button onclick="router.navigate('admin-exam-status')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'exam-status' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-list-check mr-1.5"></i> Status Ujian</button>
+                        <button onclick="router.navigate('admin-integrity')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'integrity' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-shield-halved mr-1.5"></i> Pengawasan Ujian</button>
                         <button onclick="router.navigate('admin-settings')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'settings' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-gear mr-1.5"></i> Pengaturan</button>
                     </div>
                     <button onclick="adminLogout()" class="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-sm font-semibold rounded-xl transition flex items-center space-x-1.5">
@@ -2997,6 +3086,71 @@
         };
 
         // --- ADMIN EXAM STATUS BY CLASS & CHAPTER ---
+
+        let integritySessionsCache = {};
+        let integrityListenerStarted = false;
+
+        function renderAdminIntegrityView() {
+            return `
+                <div>
+                    ${renderAdminNavbar('integrity')}
+                    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-6">
+                        <div class="flex items-start gap-4">
+                            <div class="w-12 h-12 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center text-xl"><i class="fa-solid fa-shield-halved"></i></div>
+                            <div><h2 class="text-2xl font-extrabold text-slate-900">Pengawasan Aktivitas Ujian</h2>
+                            <p class="text-sm text-slate-500 mt-1">Catatan berpindah tab, salin-tempel, dan klik kanan yang terdeteksi browser. Gunakan sebagai bahan pemeriksaan, bukan bukti tunggal kecurangan.</p></div>
+                        </div>
+                    </div>
+                    <div id="integrity-summary" class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6"></div>
+                    <div class="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
+                        <div class="p-5 border-b border-slate-100"><h3 class="font-bold text-slate-900">Log Aktivitas Terbaru</h3><p class="text-xs text-slate-500 mt-1">Data diperbarui otomatis dari Firebase.</p></div>
+                        <div class="overflow-x-auto"><table class="w-full text-left"><thead class="bg-slate-50 text-xs uppercase text-slate-500"><tr><th class="px-4 py-3">Waktu</th><th class="px-4 py-3">Siswa</th><th class="px-4 py-3">Kelas / Ujian</th><th class="px-4 py-3">Aktivitas</th><th class="px-4 py-3">Jumlah</th></tr></thead><tbody id="integrity-log-rows" class="divide-y divide-slate-100 text-sm"><tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">Memuat catatan...</td></tr></tbody></table></div>
+                    </div>
+                    <p class="text-xs text-slate-500 mt-3">Catatan: browser tidak dapat memastikan siswa membuka Google atau menggunakan perangkat kedua. Log juga bergantung pada koneksi internet dan aturan akses Firebase.</p>
+                </div>`;
+        }
+
+        function initAdminIntegrity() {
+            const sessionsRef = window.FB.ref(window.db, 'examSessions');
+            window.FB.onValue(sessionsRef, snap => {
+                integritySessionsCache = snap.exists() ? (snap.val() || {}) : {};
+                renderAdminIntegrityLogs();
+            }, err => {
+                const rows = document.getElementById('integrity-log-rows');
+                if (rows) rows.innerHTML = `<tr><td colspan="5" class="px-4 py-8 text-center text-rose-600">Tidak dapat membaca log. Periksa aturan akses Firebase.</td></tr>`;
+            });
+        }
+
+        function renderAdminIntegrityLogs() {
+            const rowsEl = document.getElementById('integrity-log-rows');
+            const summaryEl = document.getElementById('integrity-summary');
+            if (!rowsEl || !summaryEl) return;
+            const events = [];
+            let sessionsWithEvents = 0;
+            Object.entries(integritySessionsCache || {}).forEach(([sessionId, session]) => {
+                const logs = session && session.integrityEvents ? Object.entries(session.integrityEvents) : [];
+                if (logs.length) sessionsWithEvents++;
+                logs.forEach(([eventId, ev]) => events.push({ sessionId, eventId, session, ...(ev || {}) }));
+            });
+            events.sort((a,b) => Number(b.timestamp || 0) - Number(a.timestamp || 0));
+            summaryEl.innerHTML = `
+                <div class="bg-white rounded-2xl border border-slate-200 p-5"><div class="text-xs font-semibold text-slate-500">Total catatan</div><div class="text-3xl font-extrabold text-slate-900 mt-1">${events.length}</div></div>
+                <div class="bg-amber-50 rounded-2xl border border-amber-100 p-5"><div class="text-xs font-semibold text-amber-700">Sesi dengan catatan</div><div class="text-3xl font-extrabold text-amber-800 mt-1">${sessionsWithEvents}</div></div>
+                <div class="bg-indigo-50 rounded-2xl border border-indigo-100 p-5"><div class="text-xs font-semibold text-indigo-700">Perlu ditinjau</div><div class="text-3xl font-extrabold text-indigo-800 mt-1">${events.filter(e => Number(e.count || 0) >= 3).length}</div></div>`;
+            if (!events.length) {
+                rowsEl.innerHTML = `<tr><td colspan="5" class="px-4 py-8 text-center text-slate-400">Belum ada aktivitas yang tercatat. Log akan muncul ketika siswa mengerjakan ujian dan aktivitas terdeteksi.</td></tr>`;
+                return;
+            }
+            const label = type => ({ tab_hidden: 'Berpindah tab / meminimalkan browser', clipboard_copy: 'Mencoba menyalin teks', clipboard_cut: 'Mencoba memotong teks', clipboard_paste: 'Mencoba menempelkan teks', context_menu: 'Mencoba klik kanan' }[type] || type || 'Aktivitas lain');
+            rowsEl.innerHTML = events.slice(0, 300).map(e => {
+                const dt = e.timestamp ? new Date(Number(e.timestamp)).toLocaleString('id-ID') : '-';
+                const student = e.studentName || e.session?.studentName || '-';
+                const nis = e.nis || e.session?.nis || '-';
+                const klass = e.className || e.session?.className || '-';
+                const exam = e.examTitle || e.session?.examTitle || '-';
+                return `<tr><td class="px-4 py-3 whitespace-nowrap">${escapeHtml(dt)}</td><td class="px-4 py-3"><div class="font-semibold">${escapeHtml(student)}</div><div class="text-xs text-slate-500">NIS: ${escapeHtml(nis)}</div></td><td class="px-4 py-3"><div>${escapeHtml(klass)}</div><div class="text-xs text-slate-500">${escapeHtml(exam)}</div></td><td class="px-4 py-3"><div class="font-semibold">${escapeHtml(label(e.type))}</div><div class="text-xs text-slate-500">${escapeHtml(e.detail || '')}</div></td><td class="px-4 py-3"><span class="inline-flex px-2 py-1 rounded-full text-xs font-bold ${Number(e.count||0)>=3?'bg-rose-50 text-rose-700':'bg-amber-50 text-amber-700'}">${Number(e.count||0)}x</span></td></tr>`;
+            }).join('');
+        }
 
         let examStatusResultsCache = {};
         let examStatusQuestionsCache = {};
