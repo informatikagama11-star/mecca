@@ -3933,8 +3933,12 @@
             }
 
             let handlingAuthChange = false;
+            let initialAuthStateHandled = false;
             window.auth.onAuthStateChanged(async (user) => {
-                if (handlingAuthChange) return;
+                // Pemeriksaan ini hanya untuk keadaan saat aplikasi pertama kali dibuka.
+                // Jangan menjalankan logika logout saat admin baru saja berhasil login.
+                if (handlingAuthChange || initialAuthStateHandled) return;
+                initialAuthStateHandled = true;
 
                 // Pulihkan ujian siswa yang masih aktif terlebih dahulu.
                 const activeSessionId = localStorage.getItem('gamaSchoolActiveSession');
