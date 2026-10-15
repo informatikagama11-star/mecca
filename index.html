@@ -49,7 +49,7 @@
                 </div>
                 <div>
                     <h1 class="font-bold text-slate-900 leading-tight" id="header-title">Evaluasi Harian</h1>
-                    <p class="text-xs text-slate-500">Gama School - Berbasis Firebase Realtime Database</p>
+                    <p class="text-xs text-slate-500">Informatika dan Koding</p>
                 </div>
             </div>
             <div class="flex items-center space-x-2" id="header-actions">
@@ -68,7 +68,7 @@
     </main>
 
     <footer class="bg-white border-t border-slate-200 py-4 text-center text-xs text-slate-500">
-        <p>&copy; 2026 Gama School Online Assessment System. All rights reserved. Powered by Firebase Realtime Database.</p>
+        <p>&copy; Powered by Suci Safina Suhasana</p>
     </footer>
 
     <div id="modal-container" class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 backdrop-blur-sm hidden">
@@ -246,7 +246,7 @@
                 } else if(this.currentRoute.startsWith('student') || this.currentRoute === 'exam' || this.currentRoute === 'result') {
                     headerTitle.innerText = "Portal Siswa - Ujian Online";
                 } else {
-                    headerTitle.innerText = "Gama School - Evaluasi Harian";
+                    headerTitle.innerText = "SDIT Gema Insan Mandiri";
                 }
 
                 switch(this.currentRoute) {
@@ -356,10 +356,10 @@
                         <i class="fa-solid fa-sparkles"></i> <span>Sistem Ujian Online Modern & Realtime</span>
                     </div>
                     <h1 class="text-4xl sm:text-5xl font-extrabold text-slate-900 tracking-tight mb-6">
-                        Evaluasi Harian & Ujian Online <span class="text-brand-600">Gama School</span>
+                        Materi, Latihan Soal, Games, dan Ujian Online <span class="text-brand-600">Gama School</span>
                     </h1>
                     <p class="text-lg text-slate-600 mb-10 max-w-2xl mx-auto">
-                        Platform ujian berbasis web yang cepat, responsif di HP dan Komputer, didukung sinkronisasi Realtime Firebase dan penilaian otomatis.
+                        Platform ujian berbasis web dan nilai bisa dilihat oleh walimurid dengan memasukkan NIS anak dan PIN.
                     </p>
                     <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-3xl mx-auto mb-8">
                         <button onclick="openLearningPortal('materials')" class="bg-white border border-slate-200 hover:border-brand-300 hover:shadow-md rounded-2xl p-5 text-left transition">
@@ -389,7 +389,7 @@
                         </button>
                         <button onclick="router.navigate('parent-login')" class="w-full sm:w-auto px-8 py-4 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-2xl shadow-lg flex items-center justify-center space-x-3 transition">
                             <i class="fa-solid fa-people-roof text-xl"></i>
-                            <span>Login Orang Tua</span>
+                            <span>Login Wali Murid</span>
                         </button>
                     </div>
 
