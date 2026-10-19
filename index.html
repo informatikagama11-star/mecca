@@ -87,7 +87,7 @@
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
         import { getDatabase, ref, push, set, update, get, remove, onValue } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
-        import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, signInAnonymously, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, signInAnonymously, setPersistence, browserLocalPersistence } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 
         const firebaseConfig = {
             apiKey: "AIzaSyBEYp5Cl43x_vUDLSqGUVwP9Yxro7GsbRg",
@@ -106,7 +106,9 @@
 
         window.db = database;
         window.auth = auth;
-        window.FB = { ref, push, set, update, get, remove, onValue, signInWithEmailAndPassword, signOut, signInAnonymously, setPersistence, browserLocalPersistence };
+        window.FB = { ref, push, set, update, get, remove, onValue, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, signInAnonymously, setPersistence, browserLocalPersistence };
+        window.firebaseConfig = firebaseConfig;
+        window.teacherRole = null;
 
         // Toast Notification Function
         window.showToast = function(message, type = 'success') {
@@ -249,6 +251,15 @@
                     headerTitle.innerText = "SDIT Gema Insan Mandiri";
                 }
 
+                if (window.teacherRole) {
+                    const teacherAllowed = new Set(['teacher-dashboard','admin-questions','admin-results','admin-result-detail','admin-exam-status','admin-integrity','admin-settings']);
+                    if (!teacherAllowed.has(this.currentRoute)) { this.currentRoute = 'teacher-dashboard'; this.params = {}; }
+                    if (this.currentRoute === 'admin-settings') {
+                        // Guru hanya boleh memakai panel jadwal; pengaturan global disembunyikan di bawah.
+                    }
+                } else if (this.currentRoute.startsWith('teacher-')) {
+                    this.currentRoute = 'admin-login'; this.params = {};
+                }
                 switch(this.currentRoute) {
                     case 'home':
                         container.innerHTML = renderHomeView();
@@ -280,6 +291,14 @@
                     case 'admin-login':
                         container.innerHTML = renderAdminLoginView();
                         initAdminLogin();
+                        break;
+                    case 'admin-teachers':
+                        container.innerHTML = renderAdminTeachersView();
+                        initAdminTeachers();
+                        break;
+                    case 'teacher-dashboard':
+                        container.innerHTML = renderTeacherDashboardView();
+                        initTeacherDashboard();
                         break;
                     case 'admin-dashboard':
                         container.innerHTML = renderAdminDashboardView();
@@ -560,7 +579,8 @@
                             examChapter: matchedSchedule.chapter || '',
                             examDuration: matchedSchedule.duration || 60,
                             examToken: matchedSchedule.token || '',
-                            examActive: matchedSchedule.active !== false
+                            examActive: matchedSchedule.active !== false,
+                            teacherUid: matchedSchedule.teacherUid || ''
                         } : null
                     });
                 } catch (err) {
@@ -669,7 +689,8 @@
             const activeQuestions = Object.keys(all)
                 .filter(id => all[id].active !== false)
                 .map(id => ({ id, ...all[id], type: normalizeQuestionType(all[id].type) }))
-                .filter(q => getQuestionChapter(q) === selectedChapter);
+                .filter(q => getQuestionChapter(q) === selectedChapter)
+                .filter(q => !settings.teacherUid || q.createdByTeacherUid === settings.teacherUid);
 
             if (!activeQuestions.length) {
                 throw new Error(`Belum ada soal aktif untuk ${selectedChapter}.`);
@@ -860,6 +881,43 @@
         let examIntegrityLastEventAt = 0;
         let examIntegritySessionId = null;
 
+        function showIntegrityWarning(count, detail) {
+            let overlay = document.getElementById('exam-integrity-warning-overlay');
+            if (!overlay) {
+                overlay = document.createElement('div');
+                overlay.id = 'exam-integrity-warning-overlay';
+                overlay.className = 'fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/80 p-4';
+                overlay.innerHTML = `<div role="alertdialog" aria-live="assertive" class="w-full max-w-2xl rounded-3xl border-4 border-rose-600 bg-white p-6 sm:p-10 text-center shadow-2xl"><div class="text-6xl sm:text-7xl mb-4">⚠️</div><h2 class="text-3xl sm:text-5xl font-black tracking-wide text-rose-700">PERINGATAN UJIAN!</h2><p class="mt-4 text-xl sm:text-2xl font-extrabold text-slate-900">AKTIVITAS DI LUAR HALAMAN UJIAN TERDETEKSI</p><p id="exam-integrity-warning-detail" class="mt-3 text-base sm:text-lg text-slate-700"></p><p id="exam-integrity-warning-count" class="mt-4 text-lg sm:text-xl font-black text-rose-700"></p><p class="mt-4 text-sm sm:text-base text-slate-600">Tetap di halaman ujian. Jika komputer bermasalah atau sedang dibantu guru, segera beri tahu pengawas. Peringatan ini adalah catatan aktivitas, bukan bukti pasti kecurangan.</p><button id="exam-integrity-warning-close" type="button" class="mt-6 rounded-xl bg-rose-700 px-8 py-3 text-lg font-bold text-white hover:bg-rose-800">Saya Mengerti</button></div>`;
+                document.body.appendChild(overlay);
+                overlay.querySelector('#exam-integrity-warning-close').addEventListener('click', () => overlay.remove());
+            }
+            overlay.querySelector('#exam-integrity-warning-detail').textContent = detail || 'Aktivitas tidak biasa tercatat.';
+            overlay.querySelector('#exam-integrity-warning-count').textContent = `PERINGATAN KE-${count}`;
+        }
+
+        function confirmedIntegrityCount(events) {
+            return Object.values(events || {}).filter(ev => ev && ev.reviewStatus === 'confirmed').length;
+        }
+
+        async function recalculateIntegrityPenalty(resultId, resultData, sessionId) {
+            const sessionSnap = await window.FB.get(window.FB.ref(window.db, `examSessions/${sessionId}`));
+            const sessionData = sessionSnap.exists() ? sessionSnap.val() : {};
+            const events = sessionData.integrityEvents || {};
+            const confirmedCount = confirmedIntegrityCount(events);
+            const baseScore = Number(resultData.rawScore ?? resultData.baseScore ?? (Number(resultData.finalScore || 0) + Number(resultData.integrityDeduction || 0)));
+            const deduction = confirmedCount; // 1 pelanggaran terkonfirmasi = 1 poin nilai
+            const finalScore = Math.max(0, Number((baseScore - deduction).toFixed(2)));
+            await window.FB.update(window.FB.ref(window.db, `examResults/${resultId}`), {
+                rawScore: baseScore, baseScore, confirmedIntegrityCount: confirmedCount,
+                integrityDeduction: deduction, finalScore, integrityReviewedAt: Date.now()
+            });
+            await window.FB.update(window.FB.ref(window.db, `examSessions/${sessionId}`), {
+                rawScore: baseScore, baseScore, confirmedIntegrityCount: confirmedCount,
+                integrityDeduction: deduction, finalScore
+            });
+            return { baseScore, confirmedCount, deduction, finalScore, events };
+        }
+
         async function setupExamIntegrityMonitoring(sessData) {
             stopExamIntegrityMonitoring();
             if (router.currentRoute !== 'exam' || !currentExamState.sessionId) return;
@@ -896,11 +954,9 @@
                 } catch (err) {
                     console.warn('Catatan pengawasan tidak berhasil disimpan:', err);
                 }
-                let message;
-                if (examIntegrityCount === 1) message = `Peringatan 1: aktivitas di luar halaman ujian terdeteksi dan dicatat.`;
-                else if (examIntegrityCount === 2) message = `Peringatan 2: aktivitas serupa kembali terdeteksi. Catatan tersimpan.`;
-                else message = `Perhatian: aktivitas ke-${examIntegrityCount} tercatat. Guru dapat meninjau aktivitas ini.`;
-                window.showToast(message, 'warning');
+                const labels = { tab_hidden: 'Berpindah tab atau meminimalkan browser', clipboard_copy: 'Mencoba menyalin teks', clipboard_cut: 'Mencoba memotong teks', clipboard_paste: 'Mencoba menempelkan teks', context_menu: 'Mencoba membuka menu klik kanan' };
+                showIntegrityWarning(examIntegrityCount, labels[type] || detail || 'Aktivitas tidak biasa terdeteksi.');
+                window.showToast(`Peringatan aktivitas ujian ke-${examIntegrityCount} tercatat.`, 'warning');
             };
 
             const onVisibilityChange = () => {
@@ -1249,7 +1305,8 @@
                     nis: sessData.nis, classId: sessData.classId, className: sessData.className,
                     examTitle: sessData.examTitle || 'Ulangan Harian', examChapter: sessData.examChapter || 'Belum ditentukan',
                     autoPoints, manualEarned, totalPoints: totalEarned,
-                    maxPoints, finalScore,
+                    maxPoints, finalScore, rawScore: finalScore, baseScore: finalScore,
+                    confirmedIntegrityCount: 0, integrityDeduction: 0,
                     pgCorrect, pgComplexCorrect, manualCount,
                     manualGraded: manualCount === 0,
                     startTime: sessData.startTime, submitTime, status: 'completed',
@@ -1258,7 +1315,7 @@
 
                 await window.FB.set(resultRef, resultPayload);
                 await window.FB.update(window.FB.ref(window.db, `examSessions/${currentExamState.sessionId}`), {
-                    status: 'completed', submitTime, autoPoints, totalPoints: totalEarned, maxPoints, finalScore
+                    status: 'completed', submitTime, autoPoints, totalPoints: totalEarned, maxPoints, finalScore, rawScore: finalScore, baseScore: finalScore, confirmedIntegrityCount: 0, integrityDeduction: 0
                 });
                 await window.FB.update(window.FB.ref(window.db, `students/${sessData.studentId}`), {
                     examStatus: 'completed'
@@ -1345,6 +1402,14 @@
                     ? `${resData.manualCount} soal menunggu guru`
                     : 'Tidak ada';
                 document.getElementById('res-score').innerText = Number(resData.finalScore || 0).toFixed(2);
+                const scoreEl = document.getElementById('res-score');
+                if (scoreEl && !document.getElementById('result-integrity-summary')) {
+                    const summary = document.createElement('div'); summary.id = 'result-integrity-summary';
+                    summary.className = 'mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900';
+                    scoreEl.parentElement.parentElement.appendChild(summary);
+                }
+                const resultIntegritySummary = document.getElementById('result-integrity-summary');
+                if (resultIntegritySummary) resultIntegritySummary.innerHTML = `Nilai sebelum potongan: <strong>${Number(resData.rawScore ?? resData.baseScore ?? resData.finalScore ?? 0).toFixed(2)}</strong> · Pelanggaran dikonfirmasi: <strong>${Number(resData.confirmedIntegrityCount || 0)} kali</strong> · Potongan: <strong>-${Number(resData.integrityDeduction || 0)} poin</strong>. <span class="block mt-1 text-xs">Peringatan aktivitas tidak otomatis dianggap pelanggaran.</span>`;
 
                 if (resData.manualCount > 0 && !resData.manualGraded) {
                     document.getElementById('manual-notice').classList.remove('hidden');
@@ -1428,6 +1493,7 @@
                                 <div class="sm:text-right"><div class="text-2xl font-extrabold text-emerald-700">${safe(Number(r.finalScore ?? 0).toFixed(2))}</div><span class="text-xs text-slate-500">Nilai akhir</span></div>
                             </div>
                             <div class="mt-3 text-sm text-slate-600">Status: <strong>${safe(r.manualCount && !r.manualGraded ? 'Menunggu pemeriksaan guru' : (r.status === 'completed' ? 'Selesai' : (r.status || 'Tercatat')))}</strong></div>
+                            <div class="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"><div class="font-bold mb-1">Catatan Pengawasan Ujian</div><div>Jumlah pelanggaran dikonfirmasi: <strong>${safe(Number(r.confirmedIntegrityCount || 0))} kali</strong></div><div>Nilai sebelum potongan: <strong>${safe(Number(r.rawScore ?? r.baseScore ?? r.finalScore ?? 0).toFixed(2))}</strong></div><div>Potongan nilai: <strong>-${safe(Number(r.integrityDeduction || 0))} poin</strong></div><p class="mt-1 text-xs">Catatan aktivitas perlu ditinjau; peringatan otomatis bukan bukti pasti kecurangan.</p></div>
                         </div>`).join('') : '<div class="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-slate-500">Belum ada hasil ujian untuk NIS ini.</div>';
                     out.innerHTML = `
                         <div class="mb-5 rounded-2xl bg-emerald-50 border border-emerald-100 p-5">
@@ -1528,11 +1594,23 @@
 
                 window.showLoading(true, "Autentikasi admin...");
                 try {
-                    await window.FB.signInWithEmailAndPassword(window.auth, email, password);
-                    localStorage.setItem('gamaSchoolAdminLastActivity', String(Date.now()));
-                    window.showLoading(false);
-                    window.showToast('Login admin berhasil!', 'success');
-                    router.navigate('admin-dashboard');
+                    const credential = await window.FB.signInWithEmailAndPassword(window.auth, email, password);
+                    const teacherSnap = await window.FB.get(window.FB.ref(window.db, 'teacherAccounts/' + credential.user.uid));
+                    if (teacherSnap.exists() && teacherSnap.val().active !== false) {
+                        window.teacherRole = { uid: credential.user.uid, ...teacherSnap.val() };
+                        localStorage.setItem('gamaSchoolUserRole', 'teacher');
+                        localStorage.setItem('gamaSchoolAdminLastActivity', String(Date.now()));
+                        window.showLoading(false);
+                        window.showToast('Login guru berhasil!', 'success');
+                        router.navigate('teacher-dashboard');
+                    } else {
+                        window.teacherRole = null;
+                        localStorage.setItem('gamaSchoolUserRole', 'admin');
+                        localStorage.setItem('gamaSchoolAdminLastActivity', String(Date.now()));
+                        window.showLoading(false);
+                        window.showToast('Login berhasil!', 'success');
+                        router.navigate('admin-dashboard');
+                    }
                 } catch (err) {
                     window.showLoading(false);
                     console.error(err);
@@ -1542,6 +1620,21 @@
         }
 
         function renderAdminNavbar(activeTab) {
+            if (window.teacherRole) {
+                return `
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 mb-8 flex flex-wrap items-center justify-between gap-3">
+                  <div><div class="font-extrabold text-slate-900">Portal Guru</div><div class="text-xs text-slate-500">${escapeHtml(window.teacherRole.name || window.teacherRole.email || 'Guru')} · Kelas ajar terbatas</div></div>
+                  <div class="flex flex-wrap gap-2">
+                    <button onclick="router.navigate('teacher-dashboard')" class="px-3 py-2 rounded-xl text-sm font-semibold">Beranda Guru</button>
+                    <button onclick="router.navigate('admin-questions')" class="px-3 py-2 rounded-xl text-sm font-semibold">Bank Soal</button>
+                    <button onclick="router.navigate('admin-results')" class="px-3 py-2 rounded-xl text-sm font-semibold">Nilai & Penilaian</button>
+                    <button onclick="router.navigate('admin-exam-status')" class="px-3 py-2 rounded-xl text-sm font-semibold">Pantau Ulangan</button>
+                    <button onclick="router.navigate('admin-integrity')" class="px-3 py-2 rounded-xl text-sm font-semibold">Catatan Aktivitas</button>
+                    <button onclick="router.navigate('admin-settings')" class="px-3 py-2 rounded-xl text-sm font-semibold">Jadwal Terjadwal</button>
+                    <button onclick="adminLogout()" class="px-3 py-2 bg-rose-50 text-rose-700 rounded-xl text-sm font-semibold">Kembali ke Beranda</button>
+                  </div>
+                </div>`;
+            }
             return `
                 <div class="bg-white rounded-2xl shadow-sm border border-slate-200 p-4 mb-8 flex flex-wrap items-center justify-between gap-4">
                     <div class="flex items-center space-x-2 overflow-x-auto">
@@ -1556,6 +1649,7 @@
                         <button onclick="router.navigate('admin-exam-status')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'exam-status' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-list-check mr-1.5"></i> Status Ujian</button>
                         <button onclick="router.navigate('admin-integrity')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'integrity' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-shield-halved mr-1.5"></i> Pengawasan Ujian</button>
                         <button onclick="router.navigate('admin-settings')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'settings' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-gear mr-1.5"></i> Pengaturan</button>
+                        ${!window.teacherRole ? `<button onclick="router.navigate('admin-teachers')" class="px-4 py-2 rounded-xl text-sm font-semibold transition ${activeTab === 'teachers' ? 'bg-brand-600 text-white shadow-md' : 'text-slate-600 hover:bg-slate-100'}"><i class="fa-solid fa-chalkboard-user mr-1.5"></i> Guru</button>` : ''}
                     </div>
                     <button onclick="adminLogout()" class="px-4 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-sm font-semibold rounded-xl transition flex items-center space-x-1.5">
                         <i class="fa-solid fa-house"></i> <span>Kembali ke Beranda</span>
@@ -1568,6 +1662,8 @@
             try {
                 localStorage.removeItem('gamaSchoolAdminRoute');
                 localStorage.removeItem('gamaSchoolAdminLastActivity');
+                localStorage.removeItem('gamaSchoolUserRole');
+                window.teacherRole = null;
                 await window.FB.signOut(window.auth);
                 window.showToast('Logout berhasil', 'success');
                 router.navigate('home');
@@ -1575,6 +1671,78 @@
                 console.error(err);
             }
         };
+
+
+        function renderAdminTeachersView() {
+          return `<div>${renderAdminNavbar('teachers')}
+            <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 mb-6">
+              <h2 class="text-xl font-extrabold text-slate-900">Manajemen Akun Guru</h2>
+              <p class="text-sm text-slate-500 mt-1 mb-5">Admin membuat akun guru dan menentukan kelas yang boleh dikelola. Gunakan password awal yang aman dan berikan langsung kepada guru.</p>
+              <form id="teacher-create-form" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div><label class="block text-sm font-semibold mb-1">Nama Guru</label><input id="teacher-name" required class="w-full px-3 py-3 rounded-xl border" placeholder="Nama lengkap"></div>
+                <div><label class="block text-sm font-semibold mb-1">Email Login</label><input id="teacher-email" type="email" required class="w-full px-3 py-3 rounded-xl border" placeholder="guru@sekolah.sch.id"></div>
+                <div><label class="block text-sm font-semibold mb-1">Password Awal (minimal 6 karakter)</label><input id="teacher-password" type="password" minlength="6" required class="w-full px-3 py-3 rounded-xl border" autocomplete="new-password"></div>
+                <div><label class="block text-sm font-semibold mb-2">Kelas yang Diajar</label><div id="teacher-class-options" class="grid grid-cols-2 gap-2 text-sm"><span class="text-slate-400">Memuat kelas...</span></div></div>
+                <div class="md:col-span-2"><button class="px-5 py-3 rounded-xl bg-brand-600 text-white font-bold" type="submit"><i class="fa-solid fa-user-plus mr-2"></i>Buat Akun Guru</button></div>
+              </form>
+            </div>
+            <div class="bg-white rounded-2xl border border-slate-200 shadow-sm p-6"><h3 class="text-lg font-bold mb-4">Daftar Guru</h3><div id="teacher-account-list" class="space-y-3">Memuat data guru...</div></div>
+          </div>`;
+        }
+        async function initAdminTeachers() {
+          if (window.teacherRole) { router.navigate('teacher-dashboard'); return; }
+          const classSnap = await window.FB.get(window.FB.ref(window.db, 'classes'));
+          const classes = uniqueActiveClasses(classSnap.exists() ? classSnap.val() : {});
+          const box = document.getElementById('teacher-class-options');
+          box.innerHTML = classes.map(c => `<label class="flex gap-2 items-center rounded-lg border p-2"><input type="checkbox" name="teacher-class" value="${escapeHtml(c.id)}"><span>${escapeHtml(c.name || c.id)}</span></label>`).join('') || '<span>Belum ada kelas.</span>';
+          const list = async () => {
+            const snap = await window.FB.get(window.FB.ref(window.db, 'teacherAccounts'));
+            const teachers = snap.exists() ? snap.val() : {};
+            const names = Object.fromEntries(classes.map(c=>[c.id,c.name]));
+            document.getElementById('teacher-account-list').innerHTML = Object.entries(teachers).map(([uid,t]) => `<div class="border rounded-xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-3"><div><div class="font-bold">${escapeHtml(t.name || '-')}</div><div class="text-sm text-slate-500">${escapeHtml(t.email || '-')}</div><div class="text-xs text-slate-600 mt-1">Kelas: ${escapeHtml((t.classIds||[]).map(id=>names[id]||id).join(', ') || 'Belum ditentukan')}</div><div class="text-xs mt-1 ${t.active===false?'text-rose-600':'text-emerald-700'}">${t.active===false?'Dinonaktifkan':'Aktif'}</div></div><div class="flex gap-2"><button onclick="toggleTeacherAccount('${uid}',${t.active===false?'true':'false'})" class="px-3 py-2 rounded-lg border text-sm font-semibold">${t.active===false?'Aktifkan':'Nonaktifkan'}</button><button onclick="editTeacherClasses('${uid}')" class="px-3 py-2 rounded-lg border text-sm font-semibold">Ubah Kelas</button></div></div>`).join('') || '<p class="text-sm text-slate-400">Belum ada akun guru.</p>';
+          };
+          document.getElementById('teacher-create-form').addEventListener('submit', async e => {
+            e.preventDefault();
+            const name = document.getElementById('teacher-name').value.trim();
+            const email = document.getElementById('teacher-email').value.trim().toLowerCase();
+            const password = document.getElementById('teacher-password').value;
+            const classIds = [...document.querySelectorAll('input[name="teacher-class"]:checked')].map(x=>x.value);
+            if (!classIds.length) return window.showToast('Pilih minimal satu kelas ajar.','error');
+            window.showLoading(true,'Membuat akun guru...');
+            let secondaryApp;
+            try {
+              // Auth sekunder mencegah admin utama terganti oleh sesi akun guru yang baru dibuat.
+              secondaryApp = (await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js')).initializeApp(window.firebaseConfig, 'teacher-create-' + Date.now());
+              const { getAuth, createUserWithEmailAndPassword, signOut } = await import('https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js');
+              const secondaryAuth = getAuth(secondaryApp);
+              const cred = await createUserWithEmailAndPassword(secondaryAuth, email, password);
+              await window.FB.set(window.FB.ref(window.db,'teacherAccounts/'+cred.user.uid), {name,email,classIds,active:true,createdAt:Date.now(),createdBy:window.auth.currentUser?.uid||''});
+              await signOut(secondaryAuth);
+              window.showToast('Akun guru berhasil dibuat.','success');
+              e.target.reset(); await list();
+            } catch(err) { console.error(err); window.showToast('Gagal membuat akun guru: '+(err.code==='auth/email-already-in-use'?'Email sudah digunakan.':err.message),'error'); }
+            finally { window.showLoading(false); }
+          });
+          window.refreshTeacherList = list; await list();
+        }
+        window.toggleTeacherAccount = async (uid, active) => { await window.FB.update(window.FB.ref(window.db,'teacherAccounts/'+uid),{active}); await window.refreshTeacherList?.(); window.showToast(active?'Akun guru diaktifkan.':'Akun guru dinonaktifkan.'); };
+        window.editTeacherClasses = async uid => {
+          const [tSnap,cSnap] = await Promise.all([window.FB.get(window.FB.ref(window.db,'teacherAccounts/'+uid)),window.FB.get(window.FB.ref(window.db,'classes'))]);
+          if(!tSnap.exists()) return; const t=tSnap.val(); const classes=uniqueActiveClasses(cSnap.exists()?cSnap.val():{}); const current=t.classIds||[];
+          const promptText='Masukkan ID kelas yang boleh diajar, dipisahkan koma:\n'+classes.map(c=>`${c.id} = ${c.name}`).join('\n')+'\n\nSaat ini: '+current.join(', ');
+          const raw=prompt(promptText,current.join(',')); if(raw===null)return; const ids=raw.split(',').map(x=>x.trim()).filter(Boolean); const valid=ids.filter(id=>classes.some(c=>c.id===id));
+          if(!valid.length)return window.showToast('Masukkan minimal satu ID kelas yang valid.','error');
+          await window.FB.update(window.FB.ref(window.db,'teacherAccounts/'+uid),{classIds:valid}); await window.refreshTeacherList?.(); window.showToast('Kelas ajar diperbarui.');
+        };
+        function renderTeacherDashboardView() {
+          const t=window.teacherRole||{};
+          return `<div>${renderAdminNavbar('teacher-dashboard')}<div class="bg-gradient-to-r from-indigo-600 to-blue-600 text-white rounded-3xl p-7 mb-6"><div class="text-sm opacity-80">Portal Guru Gama School</div><h2 class="text-2xl font-extrabold mt-1">Selamat datang, ${escapeHtml(t.name||'Guru')}!</h2><p class="mt-2 text-sm opacity-90">Anda hanya dapat mengelola kelas ajar yang ditugaskan oleh admin.</p><div class="mt-4 text-sm"><b>Kelas ajar:</b> <span id="teacher-assigned-classes">Memuat...</span></div></div><div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4"><button onclick="router.navigate('admin-questions')" class="text-left bg-white border rounded-2xl p-5 hover:border-indigo-400"><div class="text-2xl mb-2">📚</div><b>Bank Soal</b><p class="text-sm text-slate-500 mt-1">Buat dan kelola soal milik Anda.</p></button><button onclick="router.navigate('admin-results')" class="text-left bg-white border rounded-2xl p-5 hover:border-indigo-400"><div class="text-2xl mb-2">📝</div><b>Nilai & Penilaian</b><p class="text-sm text-slate-500 mt-1">Nilai isian dan esai kelas ajar.</p></button><button onclick="router.navigate('admin-exam-status')" class="text-left bg-white border rounded-2xl p-5 hover:border-indigo-400"><div class="text-2xl mb-2">📊</div><b>Pantau Ulangan</b><p class="text-sm text-slate-500 mt-1">Pantau hasil dan status ulangan.</p></button><button onclick="router.navigate('admin-settings')" class="text-left bg-white border rounded-2xl p-5 hover:border-indigo-400"><div class="text-2xl mb-2">🗓️</div><b>Jadwal Terjadwal</b><p class="text-sm text-slate-500 mt-1">Buat jadwal dan token untuk kelas ajar.</p></button></div></div>`;
+        }
+        async function initTeacherDashboard() {
+          if (!window.teacherRole) { router.navigate('admin-login'); return; }
+          const snap=await window.FB.get(window.FB.ref(window.db,'classes')); const classes=uniqueActiveClasses(snap.exists()?snap.val():{}); const names=classes.filter(c=>(window.teacherRole.classIds||[]).includes(c.id)).map(c=>c.name||c.id);
+          const el=document.getElementById('teacher-assigned-classes'); if(el)el.textContent=names.join(', ')||'Belum ada kelas. Hubungi admin.';
+        }
 
         // --- ADMIN DASHBOARD VIEW ---
 
@@ -1916,6 +2084,9 @@
                             <button onclick="downloadCurrentParentPinList()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl text-sm shadow-md transition flex items-center space-x-2">
                                 <i class="fa-solid fa-file-csv"></i> <span>Unduh Daftar PIN</span>
                             </button>
+                            <button onclick="printStudentCards()" class="px-4 py-2 bg-violet-600 hover:bg-violet-700 text-white font-semibold rounded-xl text-sm shadow-md transition flex items-center space-x-2">
+                                <i class="fa-solid fa-id-card"></i> <span>Cetak Kartu Siswa</span>
+                            </button>
                             <button onclick="openAddStudentModal()" class="px-4 py-2 bg-brand-600 hover:bg-brand-700 text-white font-semibold rounded-xl text-sm shadow-md transition flex items-center space-x-2">
                                 <i class="fa-solid fa-plus"></i> <span>Tambah Siswa</span>
                             </button>
@@ -1944,6 +2115,132 @@
                 </div>
             `;
         }
+
+        // Cetak kartu siswa berisi NIS, kelas, token jadwal, dan PIN portal nilai.
+        // Token diambil dari jadwal yang dipilih; PIN hanya dicetak untuk dibagikan secara privat.
+        window.printStudentCards = async function() {
+            // Buka jendela langsung dari klik pengguna agar tidak dianggap popup otomatis.
+            let printWin;
+            try { printWin = window.open('', '_blank'); } catch (e) {}
+            if (!printWin) {
+                window.showToast('Jendela cetak diblokir. Izinkan pop-up untuk situs Gama School, lalu klik Cetak Kartu Siswa lagi.', 'error');
+                return;
+            }
+            const loadingPage = `<!DOCTYPE html><html lang="id"><head><meta charset="utf-8"><title>Menyiapkan Kartu Siswa</title><style>body{font:16px Arial,sans-serif;padding:28px;color:#172033}#err{color:#b91c1c;white-space:pre-wrap}</style></head><body><h2>Gama School — Kartu Siswa</h2><p id="status">Mengambil jadwal dan data siswa dari Firebase...</p><p id="err"></p></body></html>`;
+            printWin.document.open();
+            printWin.document.write(loadingPage);
+            printWin.document.close();
+
+            try {
+                if (!window.FB || !window.FB.get || !window.FB.ref || !window.db) {
+                    throw new Error('Koneksi Firebase belum siap. Muat ulang aplikasi, login kembali, lalu coba lagi.');
+                }
+                // Ambil data terbaru dari Firebase, jangan hanya mengandalkan cache tampilan admin.
+                const [scheduleSnap, classSnap, studentSnap, settingsSnap] = await Promise.all([
+                    window.FB.get(window.FB.ref(window.db, 'examSchedules')),
+                    window.FB.get(window.FB.ref(window.db, 'classes')),
+                    window.FB.get(window.FB.ref(window.db, 'students')),
+                    window.FB.get(window.FB.ref(window.db, 'settings'))
+                ]);
+                const schedules = scheduleSnap.exists() ? scheduleSnap.val() : {};
+                const classes = classSnap.exists() ? classSnap.val() : {};
+                const studentsData = studentSnap.exists() ? studentSnap.val() : {};
+                const schoolSettings = settingsSnap.exists() ? settingsSnap.val() : {};
+                const schoolName = String(schoolSettings.schoolName || 'GAMA SCHOOL');
+                const schoolLogo = String(schoolSettings.schoolLogoDataUrl || '');
+                const esc = value => String(value ?? '-').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+                const scheduleList = Object.entries(schedules)
+                    .filter(([id, x]) => x && x.active !== false && String(x.token || '').trim())
+                    .sort((a,b) => String(a[1].className || '').localeCompare(String(b[1].className || ''), 'id', {numeric:true}) || String(a[1].title || a[1].chapter || '').localeCompare(String(b[1].title || b[1].chapter || ''), 'id'));
+                if (!scheduleList.length) throw new Error('Belum ada jadwal ulangan aktif yang memiliki token. Buat/aktifkan jadwal dan token terlebih dahulu.');
+
+                const classNameFor = (st, fallback) => {
+                    const cls = st && st.classId && classes[st.classId];
+                    return String((cls && cls.name) || (st && st.className) || fallback || '-');
+                };
+                const cardCss = `
+                    *{box-sizing:border-box}html,body{margin:0;padding:0;font-family:Arial,sans-serif;color:#172033;background:#fff}
+                    .toolbar{padding:12px;margin:0 auto;max-width:1100px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+                    .toolbar label{font-weight:bold}.toolbar select{padding:9px;min-width:280px;max-width:100%;border:1px solid #94a3b8;border-radius:6px}
+                    .toolbar button{padding:9px 14px;border:0;border-radius:6px;background:#4f46e5;color:white;font-weight:bold;cursor:pointer}
+                    .notice{font-size:11px;margin:8mm auto;padding:8px;border:1px solid #bbb;max-width:194mm}
+                    .card-page{width:194mm;height:281mm;margin:0 auto;padding:0;page-break-after:always;break-after:page;overflow:hidden}
+                    .card-page:last-child{page-break-after:auto;break-after:auto}
+                    .cards{height:100%;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:repeat(4,minmax(0,1fr));gap:3mm}
+                    .student-card{border:1px solid #334155;border-radius:2mm;padding:2.2mm;min-width:0;min-height:0;height:100%;overflow:hidden;break-inside:avoid;display:flex;flex-direction:column}
+                    .card-head{display:flex;align-items:center;gap:2mm;border-bottom:1px solid #4f46e5;padding-bottom:1.5mm;margin-bottom:1.5mm}
+                    .school-mark{width:8mm;height:8mm;flex:0 0 8mm;display:flex;align-items:center;justify-content:center;border-radius:1.5mm;background:#4f46e5;color:white;font-weight:800;font-size:10px;overflow:hidden}.school-mark img{width:100%;height:100%;object-fit:contain;background:white}
+                    .school-name{font-size:8px;font-weight:800;letter-spacing:.4px}.card-subtitle{font-size:6px;color:#64748b;margin-top:1px;letter-spacing:.3px}
+                    .student-name{font-size:9px;font-weight:800;margin:1mm 0;overflow-wrap:anywhere;line-height:1.15}
+                    .detail{display:flex;justify-content:space-between;align-items:flex-start;gap:1mm;border-bottom:1px solid #e2e8f0;padding:1.1mm 0;font-size:7px;line-height:1.15}
+                    .detail span{color:#64748b;flex:0 0 40%}.detail b{text-align:right;overflow-wrap:anywhere;max-width:60%}
+                    .token b{font-size:8px;letter-spacing:.2px;color:#4338ca}.pin b{font-size:8px;letter-spacing:.2px;color:#047857}
+                    .howto{margin-top:1.5mm;padding:1.5mm;background:#f8fafc;border-radius:1mm;font-size:6.5px;line-height:1.2}.howto b{display:block;margin-bottom:.5mm}
+                    .card-foot{margin-top:auto;padding-top:1mm;font-size:5.5px;color:#64748b;text-align:center}.no-pin{color:#b91c1c}
+                    .schedule-panel{display:none}.schedule-panel.active{display:block}.empty{margin:20px;padding:16px;border:1px solid #fca5a5;color:#991b1b}
+                    @media screen{body{padding-bottom:10mm}.card-page{margin:8mm auto;border:1px dashed #cbd5e1}}
+                    @media print{.toolbar,.notice{display:none!important}.schedule-panel{display:none!important}.schedule-panel.active{display:block!important}.card-page{margin:0;box-shadow:none}}
+                    @page{size:A4 portrait;margin:8mm}
+                `;
+                const optionHtml = scheduleList.map(([id, sc], i) => {
+                    const cls = String(sc.className || (sc.classId && classes[sc.classId] && classes[sc.classId].name) || 'Kelas tidak diketahui');
+                    const title = String(sc.title || sc.chapter || 'Ulangan');
+                    return `<option value="s${i}">${esc(cls)} — ${esc(title)} (Token: ${esc(sc.token)})</option>`;
+                }).join('');
+                const panels = scheduleList.map(([scheduleId, schedule], i) => {
+                    const classId = String(schedule.classId || '');
+                    const className = String(schedule.className || (classId && classes[classId] && classes[classId].name) || '-');
+                    const allStudentEntries = Object.entries(studentsData || {}).filter(([id, st]) => st && st.active !== false && String(st.nis || '').trim());
+                    // Gunakan classId sebagai acuan utama. Jika ID kelas lama tidak cocok,
+                    // gunakan nama kelas sebagai cadangan agar data lama tetap dapat dicetak.
+                    let matchedEntries = classId ? allStudentEntries.filter(([id, st]) => String(st.classId || '') === classId) : [];
+                    if (!matchedEntries.length) {
+                        const targetClassName = className.trim().toLocaleLowerCase('id');
+                        matchedEntries = allStudentEntries.filter(([id, st]) => classNameFor(st, '').trim().toLocaleLowerCase('id') === targetClassName);
+                    }
+                    let students = matchedEntries.map(([id, st]) => ({...st, _id:id, _className:classNameFor(st, className)}))
+                      .sort((a,b) => String(a.name || '').localeCompare(String(b.name || ''), 'id', {sensitivity:'base'}));
+                    const missingPins = students.filter(st => !st.parentPin).length;
+                    const cardItems = students.map(st => `
+                        <article class="student-card">
+                            <div class="card-head"><div class="school-mark">${schoolLogo ? `<img src="${esc(schoolLogo)}" alt="Logo sekolah">` : 'GS'}</div><div><div class="school-name">${esc(schoolName)}</div><div class="card-subtitle">KARTU AKSES SISWA</div></div></div>
+                            <div class="student-name">${esc(st.name || 'Nama belum diisi')}</div>
+                            <div class="detail"><span>NIS</span><b>${esc(st.nis)}</b></div>
+                            <div class="detail"><span>Kelas</span><b>${esc(st._className)}</b></div>
+                            <div class="detail token"><span>Token ulangan</span><b>${esc(schedule.token)}</b></div>
+                            <div class="detail pin"><span>PIN cek nilai</span><b>${st.parentPin ? esc(st.parentPin) : 'BELUM ADA — hubungi admin'}</b></div>
+                            <div class="howto"><b>CARA CEK NILAI</b><div>Buka Gama School → Portal Orang Tua / Cek Nilai → masukkan NIS dan PIN pada kartu.</div></div>
+                            <div class="card-foot">Rahasiakan PIN. Simpan kartu dengan baik.</div>
+                        </article>`);
+                    const pages = [];
+                    for (let j = 0; j < cardItems.length; j += 12) pages.push(`<section class="card-page"><main class="cards">${cardItems.slice(j, j + 12).join('')}</main></section>`);
+                    return `<div class="schedule-panel${i === 0 ? ' active' : ''}" id="s${i}">
+                        <p class="notice">Kelas: <b>${esc(className)}</b> · Jadwal: <b>${esc(schedule.title || schedule.chapter || 'Ulangan')}</b> · Total kartu: ${students.length} · Maksimal 12 kartu per halaman${missingPins ? ` · <span class="no-pin">${missingPins} siswa belum memiliki PIN</span>` : ''}. Data NIS/PIN bersifat pribadi; bagikan kartu hanya kepada siswa/orang tua yang bersangkutan.</p>
+                        ${students.length ? pages.join('') : '<div class="empty">Tidak ditemukan siswa untuk jadwal/kelas ini. Periksa penempatan kelas pada Master Siswa dan Master Kelas.</div>'}
+                    </div>`;
+                }).join('');
+                const fullPage = `<!DOCTYPE html><html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Kartu Siswa Gama School</title><style>${cardCss}</style></head><body>
+                    <div class="toolbar"><label for="schedule-choice">Pilih jadwal ulangan:</label><select id="schedule-choice">${optionHtml}</select><button type="button" id="print-button">Cetak kartu / Simpan PDF</button></div>
+                    ${panels}
+                    <script>document.getElementById('schedule-choice').addEventListener('change',function(){document.querySelectorAll('.schedule-panel').forEach(function(p){p.classList.toggle('active',p.id===this.value);},this);});document.getElementById('print-button').addEventListener('click',function(){window.print();});<\/script>
+                    </body></html>`;
+                printWin.document.open();
+                printWin.document.write(fullPage);
+                printWin.document.close();
+                printWin.focus();
+            } catch (err) {
+                const message = String((err && err.message) || err || 'Kesalahan tidak diketahui');
+                try {
+                    if (printWin && !printWin.closed) {
+                        printWin.document.open();
+                        printWin.document.write(`<!DOCTYPE html><html lang="id"><head><meta charset="utf-8"><title>Gagal Menyiapkan Kartu</title><style>body{font:16px Arial;padding:28px;color:#172033}h2{color:#b91c1c}pre{white-space:pre-wrap;background:#f8fafc;padding:12px}</style></head><body><h2>Kartu siswa belum dapat disiapkan</h2><p>Periksa koneksi Firebase dan data jadwal/siswa, lalu coba lagi.</p><pre>${String(message).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]))}</pre></body></html>`);
+                        printWin.document.close();
+                    }
+                } catch (ignored) {}
+                window.showToast('Gagal menyiapkan kartu siswa: ' + message, 'error');
+                console.error('Gagal menyiapkan kartu siswa:', err);
+            }
+        };
 
         let allStudentsCache = {};
         let allClassesCache = {};
@@ -2730,6 +3027,7 @@
                 const tbody = document.getElementById('questions-tbody');
                 if (!tbody) return;
                 questionBankCache = snapshot.exists() ? snapshot.val() : {};
+                if (window.teacherRole) questionBankCache = Object.fromEntries(Object.entries(questionBankCache).filter(([id,q]) => q.createdByTeacherUid === window.teacherRole.uid));
                 const chapters = getChapterList(questionBankCache);
                 const select = document.getElementById('question-chapter-filter');
                 const current = select ? select.value : '__ALL__';
@@ -2763,6 +3061,7 @@
                 const snap = await window.FB.get(window.FB.ref(window.db, `questions/${questionId}`));
                 if (!snap.exists()) { window.showToast('Soal tidak ditemukan.', 'error'); return; }
                 existing = snap.val();
+                if (window.teacherRole && existing.createdByTeacherUid !== window.teacherRole.uid) { window.showToast('Guru hanya dapat mengubah soal yang dibuatnya sendiri.','error'); return; }
             }
 
             const modalContainer = document.getElementById('modal-container');
@@ -2853,6 +3152,7 @@
                 try {
                     const payload = {
                         chapter, type, question, options, correctAnswers, points,
+                        ...(window.teacherRole ? { createdByTeacherUid: existing?.createdByTeacherUid || window.teacherRole.uid, createdByTeacherName: window.teacherRole.name || '' } : {}),
                         active: existing?.active !== false, updatedAt: Date.now()
                     };
                     if (existing) {
@@ -2911,7 +3211,7 @@
                   keys.forEach(k=>correctAnswers[k]=true);
                   if (Object.values(options).some(v=>!v)) { window.showToast('Lengkapi pilihan A-D pada soal nomor '+card.dataset.index+'.','error'); return; }
                 }
-                payloads.push({chapter,type,question,options,correctAnswers,points:type==='PG'?1:type==='PG_COMPLEX'?2:Math.max(1,Number(card.querySelector('[data-points]')?.value||1)),active:true,createdAt:Date.now(),updatedAt:Date.now()});
+                payloads.push({chapter,type,question,options,correctAnswers,points:type==='PG'?1:type==='PG_COMPLEX'?2:Math.max(1,Number(card.querySelector('[data-points]')?.value||1)),...(window.teacherRole?{createdByTeacherUid:window.teacherRole.uid,createdByTeacherName:window.teacherRole.name||''}:{}),active:true,createdAt:Date.now(),updatedAt:Date.now()});
               }
               try {
                 const root=window.FB.ref(window.db,'questions');
@@ -2938,6 +3238,7 @@
         window.openEditQuestionModal = function(id) { openQuestionModal(id); };
 
         window.deleteQuestion = async function(id) {
+            if (window.teacherRole) { const own = questionBankCache?.[id]; if (!own || own.createdByTeacherUid !== window.teacherRole.uid) return window.showToast('Guru hanya dapat menghapus soal yang dibuatnya sendiri.','error'); }
             if (confirm('Yakin ingin menghapus soal ini?')) {
                 try {
                     await window.FB.remove(window.FB.ref(window.db, `questions/${id}`));
@@ -2964,7 +3265,10 @@
                                 <option value="">Semua BAB</option>
                             </select>
                             <button onclick="exportResultsExcel()" class="px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white font-semibold rounded-xl text-sm shadow-md transition flex items-center space-x-2">
-                                <i class="fa-solid fa-file-arrow-down"></i> <span>Export Sesuai Filter</span>
+                                <i class="fa-solid fa-file-arrow-down"></i> <span>Export Kelas/Filter Ini</span>
+                            </button>
+                            <button onclick="exportResultsByClass()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white font-semibold rounded-xl text-sm shadow-md transition flex items-center space-x-2">
+                                <i class="fa-solid fa-file-excel"></i> <span>Export Semua Kelas (Terpisah)</span>
                             </button>
                         </div>
                     </div>
@@ -3025,9 +3329,10 @@
             // Prefer Master Kelas so the filter remains usable even before
             // a class has any exam result.
             uniqueActiveClasses(window.allClassesCache || {}).forEach(c => {
-                if (c && c.name) classes[c.id] = c.name;
+                if (c && c.name && (!window.teacherRole || (window.teacherRole.classIds||[]).includes(c.id))) classes[c.id] = c.name;
             });
             Object.values(allResultsCache || {}).forEach(r => {
+                if (window.teacherRole && !(window.teacherRole.classIds||[]).includes(String(r?.classId||''))) return;
                 if (r?.classId && r?.className) classes[r.classId] = r.className;
                 else if (r?.className) classes['name:' + r.className] = r.className;
                 if (r?.examChapter) chapters.add(String(r.examChapter));
@@ -3048,7 +3353,7 @@
             const searchKey = document.getElementById('search-results-input').value.toLowerCase();
             const classFilter = document.getElementById('results-class-filter')?.value || '';
             const chapterFilter = document.getElementById('results-chapter-filter')?.value || '';
-            const keys = Object.keys(allResultsCache);
+            const keys = Object.keys(allResultsCache).filter(id => { const r=allResultsCache[id]; return !window.teacherRole || (window.teacherRole.classIds||[]).includes(String(r.classId||'')); });
 
             if (keys.length === 0) {
                 tbody.innerHTML = `<tr><td colspan="10" class="py-6 text-center text-slate-400">Belum ada hasil ujian.</td></tr>`;
@@ -3107,6 +3412,7 @@
             let dataToExport = [];
             Object.keys(allResultsCache).forEach(id => {
                 const r = allResultsCache[id];
+                if (window.teacherRole && !(window.teacherRole.classIds||[]).includes(String(r.classId||''))) return;
                 const matchClass = !classFilter || (classFilter.startsWith('name:') ? r.className === classFilter.slice(5) : r.classId === classFilter || (!r.classId && r.className === classOptionText));
                 const matchChapter = !chapterFilter || String(r.examChapter || '') === chapterFilter;
                 if (!matchClass || !matchChapter) return;
@@ -3129,6 +3435,8 @@
                 window.showToast('Tidak ada data hasil untuk diexport!', 'warning');
                 return;
             }
+            // Selalu urutkan nama siswa A-Z untuk file Excel.
+            dataToExport.sort((a, b) => String(a['Nama Siswa'] || '').localeCompare(String(b['Nama Siswa'] || ''), 'id', { sensitivity: 'base' }));
 
             const worksheet = XLSX.utils.json_to_sheet(dataToExport);
             const workbook = XLSX.utils.book_new();
@@ -3137,6 +3445,79 @@
             const safeChapter = chapterFilter ? chapterFilter.replace(/[^a-z0-9]+/gi,'_') : 'Semua_BAB';
             XLSX.writeFile(workbook, `Hasil_Ujian_${safeClass}_${safeChapter}.xlsx`);
             window.showToast(`Berhasil export ${dataToExport.length} hasil ujian!`, 'success');
+        };
+
+        // Export satu file Excel untuk setiap kelas, masing-masing diurutkan nama A-Z.
+        window.exportResultsByClass = function() {
+            if (typeof XLSX === 'undefined') {
+                window.showToast('Fitur Excel belum termuat. Periksa koneksi internet lalu coba lagi.', 'error');
+                return;
+            }
+            const chapterFilter = document.getElementById('results-chapter-filter')?.value || '';
+            const classFilter = document.getElementById('results-class-filter')?.value || '';
+            const classOptionText = document.querySelector('#results-class-filter option:checked')?.textContent || '';
+            const groups = new Map();
+
+            Object.values(allResultsCache || {}).forEach(r => {
+                if (!r) return;
+                if (window.teacherRole && !(window.teacherRole.classIds || []).includes(String(r.classId || ''))) return;
+                if (chapterFilter && String(r.examChapter || '') !== chapterFilter) return;
+                if (classFilter) {
+                    const matchClass = classFilter.startsWith('name:')
+                        ? r.className === classFilter.slice(5)
+                        : (String(r.classId || '') === classFilter || (!r.classId && r.className === classOptionText));
+                    if (!matchClass) return;
+                }
+                const className = String(r.className || 'Kelas_Tidak_Diketahui').trim();
+                const groupKey = String(r.classId || '') + '::' + className;
+                if (!groups.has(groupKey)) groups.set(groupKey, { className, rows: [] });
+                groups.get(groupKey).rows.push({
+                    'NIS': String(r.nis ?? '-'),
+                    'Nama Siswa': r.studentName || '-',
+                    'Kelas': className,
+                    'Bab': r.examChapter || 'Belum ditentukan',
+                    'PG Benar': r.pgCorrect || 0,
+                    'PG Kompleks Benar': r.pgComplexCorrect || 0,
+                    'Poin Diperoleh': r.totalPoints || 0,
+                    'Maksimal Poin': r.maxPoints || 0,
+                    'Isian/Essay': r.manualCount ? (r.manualGraded ? 'Sudah dinilai' : 'Menunggu guru') : 'Tidak ada',
+                    'Nilai Akhir': Number(r.finalScore || 0),
+                    'Tanggal Submit': new Date(r.submitTime || Date.now()).toLocaleString('id-ID')
+                });
+            });
+
+            if (!groups.size) {
+                window.showToast('Tidak ada data hasil ujian untuk diexport pada filter ini.', 'warning');
+                return;
+            }
+
+            const files = Array.from(groups.values()).sort((a, b) => a.className.localeCompare(b.className, 'id', { numeric: true, sensitivity: 'base' }));
+            files.forEach(group => group.rows.sort((a, b) => String(a['Nama Siswa']).localeCompare(String(b['Nama Siswa']), 'id', { sensitivity: 'base' })));
+            let index = 0;
+            const downloadNext = () => {
+                if (index >= files.length) {
+                    window.showToast(`Selesai menyiapkan ${files.length} file Excel, satu file untuk setiap kelas. Nama siswa sudah diurutkan A-Z.`, 'success');
+                    return;
+                }
+                const group = files[index++];
+                const ws = XLSX.utils.json_to_sheet(group.rows);
+                // Paksa kolom NIS menjadi teks agar angka nol di depan tidak hilang.
+                const range = XLSX.utils.decode_range(ws['!ref'] || 'A1');
+                for (let row = range.s.r + 1; row <= range.e.r; row++) {
+                    const cell = ws[XLSX.utils.encode_cell({ r: row, c: 0 })];
+                    if (cell) { cell.t = 's'; cell.v = String(cell.v ?? ''); }
+                }
+                ws['!cols'] = [{ wch: 18 }, { wch: 30 }, { wch: 18 }, { wch: 22 }, { wch: 12 }, { wch: 20 }, { wch: 18 }, { wch: 16 }, { wch: 20 }, { wch: 14 }, { wch: 24 }];
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, 'Hasil Ujian');
+                const safeClass = group.className.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') || 'Kelas';
+                const safeChapter = chapterFilter ? chapterFilter.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '') : 'Semua_BAB';
+                XLSX.writeFile(wb, `Hasil_Ujian_${safeClass}_${safeChapter}.xlsx`);
+                // Beri jeda agar browser lebih mungkin menerima unduhan berurutan.
+                if (index < files.length) setTimeout(downloadNext, 350);
+                else setTimeout(() => window.showToast(`Selesai mengirim ${files.length} file Excel untuk diunduh.`, 'success'), 400);
+            };
+            downloadNext();
         };
 
         // --- ADMIN EXAM STATUS BY CLASS & CHAPTER ---
@@ -3182,6 +3563,7 @@
             const events = [];
             let sessionsWithEvents = 0;
             Object.entries(integritySessionsCache || {}).forEach(([sessionId, session]) => {
+                if (window.teacherRole && !(window.teacherRole.classIds||[]).includes(String(session?.classId||''))) return;
                 const logs = session && session.integrityEvents ? Object.entries(session.integrityEvents) : [];
                 if (logs.length) sessionsWithEvents++;
                 logs.forEach(([eventId, ev]) => events.push({ sessionId, eventId, session, ...(ev || {}) }));
@@ -3248,13 +3630,14 @@
             });
             window.FB.onValue(questionsRef, snap => {
                 examStatusQuestionsCache = snap.exists() ? snap.val() : {};
+                if (window.teacherRole) examStatusQuestionsCache = Object.fromEntries(Object.entries(examStatusQuestionsCache).filter(([id,q])=>q.createdByTeacherUid===window.teacherRole.uid));
                 renderExamStatusBySelection();
             });
             initExamStatusStudentsListener();
             window.FB.onValue(classesRef, snap => {
                 examStatusClassesCache = snap.exists() ? snap.val() : {};
                 const current = classSelect.value;
-                const unique = uniqueActiveClasses(examStatusClassesCache);
+                const unique = uniqueActiveClasses(examStatusClassesCache).filter(c => !window.teacherRole || (window.teacherRole.classIds||[]).includes(c.id));
                 classSelect.innerHTML = `<option value="">Pilih kelas...</option>` + unique.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name||c.id)}</option>`).join('');
                 if (unique.some(c=>c.id===current)) classSelect.value=current;
                 else if (unique.length) classSelect.value=unique[0].id;
@@ -3386,6 +3769,7 @@
                     <div class="mb-4 bg-blue-50 border border-blue-200 text-blue-800 rounded-xl p-4 text-sm">
                         PG otomatis 1 poin. PG Kompleks mendapat 2 poin jika tepat seluruh kunci. Isian dan essay dinilai guru sesuai maksimal poin soal.
                     </div>
+                    <div class="mb-6 rounded-2xl border border-amber-200 bg-amber-50 p-5"><h3 class="font-bold text-amber-900 text-lg mb-1"><i class="fa-solid fa-shield-halved mr-2"></i>Catatan Aktivitas & Pelanggaran</h3><p class="text-sm text-amber-800 mb-3">Peringatan otomatis hanya indikasi. Hanya admin yang dapat mengonfirmasi pelanggaran atau menghapus catatan. Setiap pelanggaran yang dikonfirmasi memotong 1 poin nilai.</p><div id="detail-integrity-summary" class="mb-3 text-sm font-semibold text-slate-800"></div><div id="detail-integrity-events" class="space-y-3"></div></div>
                     <div id="detail-questions-container" class="space-y-4"></div>
                     <button id="save-manual-grades-btn" class="w-full mt-6 py-4 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-2xl shadow-lg">
                         <i class="fa-solid fa-floppy-disk mr-2"></i> Simpan Nilai Isian & Essay
@@ -3400,6 +3784,7 @@
                 const rSnap = await window.FB.get(window.FB.ref(window.db, `examResults/${params.resultId}`));
                 if (!rSnap.exists()) throw new Error("Hasil tidak ditemukan.");
                 const resData = rSnap.val();
+                if (window.teacherRole && !(window.teacherRole.classIds||[]).includes(String(resData.classId||''))) throw new Error('Anda tidak memiliki kewenangan untuk menilai kelas ini.');
 
                 const sessSnap = await window.FB.get(window.FB.ref(window.db, `examSessions/${resData.sessionId}`));
                 if (!sessSnap.exists()) throw new Error("Sesi ulangan tidak ditemukan.");
@@ -3416,6 +3801,63 @@
                 document.getElementById('detail-class').innerText = `${resData.className || '-'} (NIS: ${resData.nis || '-'})`;
                 document.getElementById('detail-score').innerText = Number(resData.finalScore || 0).toFixed(2);
                 document.getElementById('detail-final-score').innerText = Number(resData.finalScore || 0).toFixed(2);
+
+                const integrityEventsBox = document.getElementById('detail-integrity-events');
+                const integritySummaryBox = document.getElementById('detail-integrity-summary');
+                const isAdminReviewer = !window.teacherRole && !!window.auth?.currentUser && !window.auth.currentUser.isAnonymous;
+                const eventLabels = { tab_hidden: 'Berpindah tab / meminimalkan browser', clipboard_copy: 'Mencoba menyalin teks', clipboard_cut: 'Mencoba memotong teks', clipboard_paste: 'Mencoba menempelkan teks', context_menu: 'Mencoba membuka menu klik kanan' };
+                const renderIntegrityEvents = async () => {
+                    const freshSnap = await window.FB.get(window.FB.ref(window.db, `examSessions/${resData.sessionId}/integrityEvents`));
+                    const events = freshSnap.exists() ? freshSnap.val() : {};
+                    const entries = Object.entries(events).sort((a,b)=>Number(a[1]?.timestamp||0)-Number(b[1]?.timestamp||0));
+                    const confirmed = entries.filter(([id,ev])=>ev?.reviewStatus==='confirmed').length;
+                    const deduction = confirmed;
+                    integritySummaryBox.innerHTML = `Peringatan tercatat: <strong>${entries.length}</strong> · Pelanggaran dikonfirmasi: <strong>${confirmed}</strong> · Potongan: <strong>-${deduction} poin</strong> · Nilai sebelum potongan: <strong>${Number(resData.rawScore ?? resData.baseScore ?? resData.finalScore ?? 0).toFixed(2)}</strong>`;
+                    integrityEventsBox.innerHTML = entries.length ? entries.map(([eventId,ev])=>{
+                        const status = ev.reviewStatus==='confirmed' ? '<span class="font-bold text-rose-700">Pelanggaran dikonfirmasi (−1 poin)</span>' : ev.reviewStatus==='dismissed' ? '<span class="font-bold text-emerald-700">Catatan dihapus oleh admin</span>' : '<span class="font-bold text-amber-700">Belum ditinjau</span>';
+                        const date = ev.timestamp ? new Date(Number(ev.timestamp)).toLocaleString('id-ID') : '-';
+                        const actions = isAdminReviewer && ev.reviewStatus!=='confirmed' ? `<button type="button" data-integrity-confirm="${eventId}" class="rounded-lg bg-rose-700 px-3 py-2 text-xs font-bold text-white">Konfirmasi pelanggaran</button>` : '';
+                        const deleteAction = isAdminReviewer ? `<button type="button" data-integrity-delete="${eventId}" class="rounded-lg border border-slate-300 bg-white px-3 py-2 text-xs font-bold text-slate-700">Hapus catatan</button>` : '';
+                        return `<div class="rounded-xl border border-amber-200 bg-white p-4"><div class="font-bold text-slate-900">${escapeHtml(eventLabels[ev.type]||ev.type||'Aktivitas')}</div><div class="mt-1 text-xs text-slate-500">${escapeHtml(date)} · ${escapeHtml(ev.detail||'')}</div><div class="mt-2 text-sm">${status}</div>${ev.reviewNote?`<div class="mt-1 text-xs text-slate-600">Catatan admin: ${escapeHtml(ev.reviewNote)}</div>`:''}<div class="mt-3 flex flex-wrap gap-2">${actions}${deleteAction}</div></div>`;
+                    }).join('') : '<p class="rounded-xl border border-dashed border-slate-300 bg-white p-4 text-sm text-slate-500">Belum ada catatan aktivitas pada sesi ini.</p>';
+                    integrityEventsBox.querySelectorAll('[data-integrity-confirm]').forEach(btn=>btn.onclick=async()=>{
+                        const eventId=btn.dataset.integrityConfirm;
+                        const note=prompt('Catatan pemeriksaan admin (opsional):','Pelanggaran dikonfirmasi');
+                        if(note===null)return;
+                        try {
+                            await window.FB.update(window.FB.ref(window.db,`examSessions/${resData.sessionId}/integrityEvents/${eventId}`),{reviewStatus:'confirmed',reviewNote:note,reviewedAt:Date.now(),reviewedBy:window.auth.currentUser?.email||window.auth.currentUser?.uid||'admin'});
+                            const latest=(await window.FB.get(window.FB.ref(window.db,`examSessions/${resData.sessionId}/integrityEvents`))).val()||{};
+                            const confirmedCount=confirmedIntegrityCount(latest);
+                            const baseScore=Number(resData.rawScore ?? resData.baseScore ?? (Number(resData.finalScore||0)+Number(resData.integrityDeduction||0)));
+                            const finalScore=Math.max(0,Number((baseScore-confirmedCount).toFixed(2)));
+                            await window.FB.update(window.FB.ref(window.db,`examResults/${params.resultId}`),{rawScore:baseScore,baseScore,confirmedIntegrityCount:confirmedCount,integrityDeduction:confirmedCount,finalScore,integrityReviewedAt:Date.now()});
+                            await window.FB.update(window.FB.ref(window.db,`examSessions/${resData.sessionId}`),{rawScore:baseScore,baseScore,confirmedIntegrityCount:confirmedCount,integrityDeduction:confirmedCount,finalScore});
+                            resData.rawScore=baseScore;resData.baseScore=baseScore;resData.confirmedIntegrityCount=confirmedCount;resData.integrityDeduction=confirmedCount;resData.finalScore=finalScore;
+                            document.getElementById('detail-score').innerText=finalScore.toFixed(2);document.getElementById('detail-final-score').innerText=finalScore.toFixed(2);
+                            await renderIntegrityEvents();window.showToast('Pelanggaran dikonfirmasi dan nilai diperbarui.','success');
+                        } catch(err){window.showToast('Gagal memperbarui catatan: '+err.message,'error');}
+                    });
+                    integrityEventsBox.querySelectorAll('[data-integrity-delete]').forEach(btn=>btn.onclick=async()=>{
+                        if(!isAdminReviewer)return window.showToast('Hanya admin yang dapat menghapus catatan.','error');
+                        const eventId=btn.dataset.integrityDelete;
+                        const note=prompt('Alasan menghapus catatan (wajib):','Gangguan komputer / bantuan pengawas');
+                        if(!note || !note.trim())return window.showToast('Alasan penghapusan wajib diisi.','error');
+                        try {
+                            // Catatan tidak dihapus permanen; ditandai dismissed agar jejak audit tetap ada.
+                            await window.FB.update(window.FB.ref(window.db,`examSessions/${resData.sessionId}/integrityEvents/${eventId}`),{reviewStatus:'dismissed',reviewNote:note.trim(),reviewedAt:Date.now(),reviewedBy:window.auth.currentUser?.email||window.auth.currentUser?.uid||'admin'});
+                            const latest=(await window.FB.get(window.FB.ref(window.db,`examSessions/${resData.sessionId}/integrityEvents`))).val()||{};
+                            const confirmedCount=confirmedIntegrityCount(latest);
+                            const baseScore=Number(resData.rawScore ?? resData.baseScore ?? (Number(resData.finalScore||0)+Number(resData.integrityDeduction||0)));
+                            const finalScore=Math.max(0,Number((baseScore-confirmedCount).toFixed(2)));
+                            await window.FB.update(window.FB.ref(window.db,`examResults/${params.resultId}`),{rawScore:baseScore,baseScore,confirmedIntegrityCount:confirmedCount,integrityDeduction:confirmedCount,finalScore,integrityReviewedAt:Date.now()});
+                            await window.FB.update(window.FB.ref(window.db,`examSessions/${resData.sessionId}`),{rawScore:baseScore,baseScore,confirmedIntegrityCount:confirmedCount,integrityDeduction:confirmedCount,finalScore});
+                            resData.rawScore=baseScore;resData.baseScore=baseScore;resData.confirmedIntegrityCount=confirmedCount;resData.integrityDeduction=confirmedCount;resData.finalScore=finalScore;
+                            document.getElementById('detail-score').innerText=finalScore.toFixed(2);document.getElementById('detail-final-score').innerText=finalScore.toFixed(2);
+                            await renderIntegrityEvents();window.showToast('Catatan ditandai sebagai dikesampingkan. Riwayat tetap tersimpan.','success');
+                        } catch(err){window.showToast('Gagal memperbarui catatan: '+err.message,'error');}
+                    });
+                };
+                await renderIntegrityEvents();
 
                 const container = document.getElementById('detail-questions-container');
                 container.innerHTML = '';
@@ -3513,20 +3955,23 @@
                             }
                         });
 
-                        const finalScore = maxTotal ? Number(((earnedTotal / maxTotal) * 100).toFixed(2)) : 0;
+                        const rawScore = maxTotal ? Number(((earnedTotal / maxTotal) * 100).toFixed(2)) : 0;
+                        const integritySnap = await window.FB.get(window.FB.ref(window.db, `examSessions/${resData.sessionId}/integrityEvents`));
+                        const confirmedCount = confirmedIntegrityCount(integritySnap.exists() ? integritySnap.val() : {});
+                        const integrityDeduction = confirmedCount;
+                        const finalScore = Math.max(0, Number((rawScore - integrityDeduction).toFixed(2)));
                         await window.FB.update(window.FB.ref(window.db, `examResults/${params.resultId}`), {
                             manualScores: manualScoresNew,
                             manualEarned: Number((earnedTotal - Number(resData.autoPoints || 0)).toFixed(2)),
                             totalPoints: Number(earnedTotal.toFixed(2)),
                             maxPoints: maxTotal,
-                            finalScore,
+                            rawScore, baseScore: rawScore, confirmedIntegrityCount: confirmedCount, integrityDeduction, finalScore,
                             manualGraded: true,
                             gradedAt: Date.now()
                         });
                         await window.FB.update(window.FB.ref(window.db, `examSessions/${resData.sessionId}`), {
-                            totalPoints: Number(earnedTotal.toFixed(2)),
-                            maxPoints: maxTotal,
-                            finalScore
+                            totalPoints: Number(earnedTotal.toFixed(2)), maxPoints: maxTotal,
+                            rawScore, baseScore: rawScore, confirmedIntegrityCount: confirmedCount, integrityDeduction, finalScore
                         });
                         await window.FB.set(window.FB.push(window.FB.ref(window.db, `examHistory/${resData.studentId}`)), {
                             resultId: params.resultId,
@@ -4037,6 +4482,30 @@
                             </button>
                         </form>
                     </div>
+                    <div id="school-identity-panel" class="max-w-3xl mt-6 bg-white rounded-2xl border border-emerald-200 shadow-sm p-8">
+                        <h3 class="text-lg font-bold text-slate-900 mb-2"><i class="fa-solid fa-school mr-2 text-emerald-600"></i>Identitas Sekolah & Logo Kartu</h3>
+                        <p class="text-sm text-slate-500 mb-5">Unggah logo sekolah di sini. Logo akan tersimpan di pengaturan Gama School dan tampil pada kartu siswa saat dicetak.</p>
+                        <div class="space-y-4">
+                            <div>
+                                <label for="school-name-input" class="block text-sm font-semibold text-slate-700 mb-2">Nama Sekolah</label>
+                                <input id="school-name-input" type="text" maxlength="100" value="SDIT Gema Insan Mandiri" class="w-full px-4 py-3 rounded-xl border border-slate-300" placeholder="Nama sekolah">
+                            </div>
+                            <div>
+                                <label for="school-logo-file" class="block text-sm font-semibold text-slate-700 mb-2">Logo Sekolah (PNG/JPG/JPEG/WebP)</label>
+                                <input id="school-logo-file" type="file" accept="image/png,image/jpeg,image/webp" class="block w-full text-sm text-slate-600 file:mr-4 file:rounded-lg file:border-0 file:bg-emerald-50 file:px-4 file:py-2 file:font-semibold file:text-emerald-700">
+                                <p class="text-xs text-slate-500 mt-2">Saran: gunakan gambar logo yang jelas. Gambar akan diperkecil otomatis agar tidak terlalu besar saat disimpan.</p>
+                            </div>
+                            <div class="flex items-center gap-4 p-4 rounded-xl bg-slate-50 border border-slate-200">
+                                <img id="school-logo-preview" alt="Pratinjau logo sekolah" class="w-20 h-20 object-contain rounded-lg bg-white border border-slate-200 p-1" style="display:none">
+                                <div id="school-logo-placeholder" class="w-20 h-20 rounded-lg bg-emerald-50 text-emerald-700 flex items-center justify-center text-2xl"><i class="fa-solid fa-image"></i></div>
+                                <div class="text-sm text-slate-600"><b>Pratinjau logo</b><p id="school-logo-status" class="text-xs mt-1">Belum ada logo yang diunggah.</p></div>
+                            </div>
+                            <div class="flex flex-wrap gap-3">
+                                <button type="button" id="save-school-identity" class="px-5 py-3 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold"><i class="fa-solid fa-floppy-disk mr-2"></i>Simpan Identitas Sekolah</button>
+                                <button type="button" id="remove-school-logo" class="px-5 py-3 rounded-xl bg-white border border-rose-200 text-rose-700 font-semibold">Hapus Logo</button>
+                            </div>
+                        </div>
+                    </div>
                     <div class="max-w-3xl mt-6 bg-white rounded-2xl border border-indigo-200 shadow-sm p-8">
                         <h3 class="text-lg font-bold text-slate-900 mb-2">Jadwal Ulangan Banyak Kelas / Sesi</h3>
                         <p class="text-sm text-slate-500 mb-5">Buat jadwal untuk tiap kelas dan sesi sekaligus. Token dibuat otomatis dan tersimpan per jadwal, jadi tidak perlu mengganti token setiap kali pindah kelas.</p>
@@ -4057,6 +4526,7 @@
         }
 
         async function initAdminSettings() {
+            if (window.teacherRole) { const globalForm=document.getElementById('settings-form'); if(globalForm) globalForm.closest('.max-w-3xl')?.classList.add('hidden'); document.getElementById('school-identity-panel')?.classList.add('hidden'); const title=document.querySelector('#app-container h2'); if(title) title.textContent='Jadwal Terjadwal Kelas Ajar'; }
             window.showLoading(true, "Memuat pengaturan...");
             try {
                 const [settingsSnap, questionsSnap, classesSnap] = await Promise.all([
@@ -4066,6 +4536,102 @@
                 ]);
                 const settings = settingsSnap.exists() ? settingsSnap.val() : {};
                 const questions = questionsSnap.exists() ? questionsSnap.val() : {};
+                // Identitas sekolah dan logo yang dipakai pada kartu cetak.
+                const schoolNameInput = document.getElementById('school-name-input');
+                const logoInput = document.getElementById('school-logo-file');
+                const logoPreview = document.getElementById('school-logo-preview');
+                const logoPlaceholder = document.getElementById('school-logo-placeholder');
+                const logoStatus = document.getElementById('school-logo-status');
+                let pendingSchoolLogo = settings.schoolLogoDataUrl || '';
+                if (schoolNameInput) schoolNameInput.value = settings.schoolName || 'SDIT Gema Insan Mandiri';
+                const showLogoPreview = (dataUrl, message) => {
+                    if (!logoPreview || !logoPlaceholder) return;
+                    if (dataUrl) {
+                        logoPreview.src = dataUrl;
+                        logoPreview.style.display = 'block';
+                        logoPlaceholder.style.display = 'none';
+                        if (logoStatus) logoStatus.textContent = message || 'Logo siap digunakan pada kartu cetak.';
+                    } else {
+                        logoPreview.removeAttribute('src');
+                        logoPreview.style.display = 'none';
+                        logoPlaceholder.style.display = 'flex';
+                        if (logoStatus) logoStatus.textContent = message || 'Belum ada logo yang diunggah.';
+                    }
+                };
+                showLogoPreview(pendingSchoolLogo, pendingSchoolLogo ? 'Logo tersimpan. Simpan perubahan jika mengganti logo.' : '');
+                if (logoInput && !logoInput.dataset.bound) {
+                    logoInput.dataset.bound = '1';
+                    logoInput.addEventListener('change', () => {
+                        const file = logoInput.files && logoInput.files[0];
+                        if (!file) return;
+                        if (!/^image\/(png|jpeg|webp)$/.test(file.type)) {
+                            logoInput.value = '';
+                            window.showToast('Pilih file logo PNG, JPG, atau WebP.', 'error');
+                            return;
+                        }
+                        if (file.size > 8 * 1024 * 1024) {
+                            logoInput.value = '';
+                            window.showToast('Ukuran file logo maksimal 8 MB.', 'error');
+                            return;
+                        }
+                        const reader = new FileReader();
+                        reader.onload = () => {
+                            const img = new Image();
+                            img.onload = () => {
+                                const maxSide = 360;
+                                const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+                                const canvas = document.createElement('canvas');
+                                canvas.width = Math.max(1, Math.round(img.width * scale));
+                                canvas.height = Math.max(1, Math.round(img.height * scale));
+                                const ctx = canvas.getContext('2d');
+                                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                                pendingSchoolLogo = canvas.toDataURL('image/png');
+                                showLogoPreview(pendingSchoolLogo, 'Logo baru siap disimpan.');
+                            };
+                            img.onerror = () => window.showToast('Gambar logo tidak dapat dibaca. Coba file lain.', 'error');
+                            img.src = reader.result;
+                        };
+                        reader.onerror = () => window.showToast('Gagal membaca file logo.', 'error');
+                        reader.readAsDataURL(file);
+                    });
+                }
+                const saveIdentityButton = document.getElementById('save-school-identity');
+                if (saveIdentityButton && !saveIdentityButton.dataset.bound) {
+                    saveIdentityButton.dataset.bound = '1';
+                    saveIdentityButton.addEventListener('click', async () => {
+                        try {
+                            saveIdentityButton.disabled = true;
+                            saveIdentityButton.textContent = 'Menyimpan...';
+                            await window.FB.update(window.FB.ref(window.db, 'settings'), {
+                                schoolName: (schoolNameInput?.value || '').trim() || 'SDIT Gema Insan Mandiri',
+                                schoolLogoDataUrl: pendingSchoolLogo || ''
+                            });
+                            window.showToast('Identitas sekolah dan logo berhasil disimpan.', 'success');
+                            showLogoPreview(pendingSchoolLogo, pendingSchoolLogo ? 'Logo tersimpan dan akan muncul pada kartu cetak.' : 'Nama sekolah tersimpan; belum ada logo.');
+                        } catch (err) {
+                            window.showToast('Gagal menyimpan identitas sekolah: ' + (err.message || err), 'error');
+                        } finally {
+                            saveIdentityButton.disabled = false;
+                            saveIdentityButton.innerHTML = '<i class="fa-solid fa-floppy-disk mr-2"></i>Simpan Identitas Sekolah';
+                        }
+                    });
+                }
+                const removeLogoButton = document.getElementById('remove-school-logo');
+                if (removeLogoButton && !removeLogoButton.dataset.bound) {
+                    removeLogoButton.dataset.bound = '1';
+                    removeLogoButton.addEventListener('click', async () => {
+                        pendingSchoolLogo = '';
+                        if (logoInput) logoInput.value = '';
+                        showLogoPreview('', 'Logo akan dihapus setelah disimpan.');
+                        try {
+                            await window.FB.update(window.FB.ref(window.db, 'settings'), { schoolLogoDataUrl: '' });
+                            window.showToast('Logo sekolah dihapus dari pengaturan.', 'success');
+                        } catch (err) {
+                            window.showToast('Pratinjau dihapus, tetapi penyimpanan gagal: ' + (err.message || err), 'error');
+                        }
+                    });
+                }
                 const classesData = classesSnap.exists() ? classesSnap.val() : {};
                 const activeClasses = uniqueActiveClasses(classesData).map(c => [c.id, c]);
                 const classSelect = document.getElementById('set-class');
@@ -4106,6 +4672,7 @@
 
             document.getElementById('settings-form').addEventListener('submit', async (e) => {
                 e.preventDefault();
+                if (window.teacherRole) return window.showToast('Guru tidak dapat mengubah Pengaturan Ulangan Admin. Gunakan Jadwal Terjadwal.','error');
                 try {
                     const classSelect = document.getElementById('set-class');
                     const selectedClassId = classSelect ? classSelect.value.trim() : '';
@@ -4148,12 +4715,13 @@
             ]);
             const classes = uniqueActiveClasses(classesSnap.exists() ? classesSnap.val() : {});
             const chapters = getChapterList(questionsSnap.exists() ? questionsSnap.val() : {});
-            document.getElementById('sched-class').innerHTML = classes.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name || c.id)}</option>`).join('') || '<option value="">Belum ada kelas</option>';
+            const allowedClasses = window.teacherRole ? classes.filter(c => (window.teacherRole.classIds||[]).includes(c.id)) : classes;
+            document.getElementById('sched-class').innerHTML = allowedClasses.map(c => `<option value="${escapeHtml(c.id)}">${escapeHtml(c.name || c.id)}</option>`).join('') || '<option value="">Belum ada kelas ajar</option>';
             document.getElementById('sched-chapter').innerHTML = chapters.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('') || '<option value="">Belum ada bab</option>';
             const refreshList = async () => {
                 const snap = await window.FB.get(window.FB.ref(window.db, 'examSchedules'));
                 const data = snap.exists() ? snap.val() : {};
-                const entries = Object.entries(data).sort((a,b) => String(a[1].startAt||'').localeCompare(String(b[1].startAt||'')));
+                const entries = Object.entries(data).filter(([id,x]) => !window.teacherRole || String(x.teacherUid||'') === window.teacherRole.uid || ((window.teacherRole.classIds||[]).includes(String(x.classId||'')) && !x.teacherUid)).sort((a,b) => String(a[1].startAt||'').localeCompare(String(b[1].startAt||'')));
                 const box = document.getElementById('exam-schedule-list');
                 if (!entries.length) { box.innerHTML = '<p class="text-slate-400">Belum ada jadwal sesi.</p>'; return; }
                 box.innerHTML = entries.map(([id,x]) => `<div class="p-4 rounded-xl border ${x.active ? 'border-indigo-100 bg-indigo-50' : 'border-slate-200 bg-slate-50'}"><div class="font-bold">${escapeHtml(x.title || 'Ulangan')} · ${escapeHtml(x.className || '-')}</div><div class="text-slate-600 mt-1">${escapeHtml(x.chapter || '-')} · ${escapeHtml(x.startAt || '-').replace('T',' ')} sampai ${escapeHtml(x.endAt || '-').replace('T',' ')}</div><div class="mt-2 flex flex-wrap items-center gap-2"><span class="px-3 py-1 bg-white rounded-lg border font-extrabold tracking-widest">${escapeHtml(x.token || '-')}</span><span class="text-xs ${x.active ? 'text-emerald-700' : 'text-slate-500'}">${x.active ? 'Aktif' : 'Nonaktif'}</span><button type="button" onclick="toggleExamSchedule('${id}',${!x.active})" class="px-3 py-1 rounded-lg border bg-white font-semibold">${x.active ? 'Nonaktifkan' : 'Aktifkan'}</button><button type="button" onclick="deleteExamSchedule('${id}')" class="px-3 py-1 rounded-lg border border-rose-200 text-rose-700 bg-white font-semibold">Hapus</button></div></div>`).join('');
@@ -4166,13 +4734,14 @@
                 const startAt = document.getElementById('sched-start').value;
                 const endAt = document.getElementById('sched-end').value;
                 if (!classId || !chapter) return window.showToast('Pilih kelas dan bab terlebih dahulu.', 'error');
+                if (window.teacherRole && !(window.teacherRole.classIds||[]).includes(classId)) return window.showToast('Anda hanya dapat membuat jadwal untuk kelas ajar sendiri.','error');
                 if (!startAt || !endAt || new Date(endAt) <= new Date(startAt)) return window.showToast('Waktu selesai harus setelah waktu mulai.', 'error');
                 const qSnap = await window.FB.get(window.FB.ref(window.db, 'questions'));
                 const qs = qSnap.exists() ? qSnap.val() : {};
-                if (!Object.values(qs).some(q => q.active !== false && getQuestionChapter(q) === chapter)) return window.showToast('Belum ada soal aktif untuk bab tersebut.', 'error');
+                if (!Object.values(qs).some(q => q.active !== false && getQuestionChapter(q) === chapter && (!window.teacherRole || q.createdByTeacherUid === window.teacherRole.uid))) return window.showToast('Belum ada soal aktif milik Anda untuk bab tersebut.', 'error');
                 const token = 'GAMA' + Math.floor(100000 + Math.random() * 900000);
                 const id = 'schedule_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
-                const schedule = { title: document.getElementById('sched-title').value.trim(), classId, className, chapter, startAt, endAt, duration: parseInt(document.getElementById('sched-duration').value,10)||10, token, active: document.getElementById('sched-active').checked, createdAt: new Date().toISOString() };
+                const schedule = { title: document.getElementById('sched-title').value.trim(), classId, className, chapter, startAt, endAt, duration: parseInt(document.getElementById('sched-duration').value,10)||10, token, active: document.getElementById('sched-active').checked, ...(window.teacherRole?{teacherUid:window.teacherRole.uid,teacherName:window.teacherRole.name||''}:{}), createdAt: new Date().toISOString() };
                 await window.FB.set(window.FB.ref(window.db, 'examSchedules/' + id), schedule);
                 window.showToast('Jadwal tersimpan dan token dibuat otomatis.', 'success');
                 form.reset(); document.getElementById('sched-duration').value = 10; document.getElementById('sched-active').checked = true;
@@ -4182,11 +4751,13 @@
             await refreshList();
         }
         window.toggleExamSchedule = async function(id, active) {
+            if (window.teacherRole) { const ss=await window.FB.get(window.FB.ref(window.db,'examSchedules/'+id)); const sch=ss.exists()?ss.val():{}; if (sch.teacherUid !== window.teacherRole.uid) return window.showToast('Guru hanya dapat mengubah jadwal yang dibuatnya sendiri.','error'); }
             await window.FB.update(window.FB.ref(window.db, 'examSchedules/' + id), {active});
             await window.refreshExamScheduleList?.();
             window.showToast(active ? 'Jadwal diaktifkan.' : 'Jadwal dinonaktifkan.', 'success');
         };
         window.deleteExamSchedule = async function(id) {
+            if (window.teacherRole) { const ss=await window.FB.get(window.FB.ref(window.db,'examSchedules/'+id)); const sch=ss.exists()?ss.val():{}; if (sch.teacherUid !== window.teacherRole.uid) return window.showToast('Guru hanya dapat menghapus jadwal yang dibuatnya sendiri.','error'); }
             if (!confirm('Hapus jadwal ini?')) return;
             await window.FB.set(window.FB.ref(window.db, 'examSchedules/' + id), null);
             await window.refreshExamScheduleList?.();
@@ -4194,6 +4765,7 @@
         };
 
         window.generateExamToken = async function() {
+            if (window.teacherRole) return window.showToast('Guru tidak dapat mengubah token pengaturan umum. Buat jadwal untuk menghasilkan token khusus.','error');
             const token = 'GAMA' + Math.floor(1000 + Math.random() * 9000);
             document.getElementById('set-token').value = token;
             try {
@@ -4263,6 +4835,23 @@
                     }
                 }
 
+                // Pulihkan peran guru berdasarkan UID Firebase, bukan hanya nilai localStorage.
+                if (user && !user.isAnonymous) {
+                    try {
+                        const teacherSnap = await window.FB.get(window.FB.ref(window.db, 'teacherAccounts/' + user.uid));
+                        if (teacherSnap.exists() && teacherSnap.val().active === false) {
+                            await window.FB.signOut(window.auth); localStorage.removeItem(GAMA_ADMIN_LAST_ACTIVITY_KEY); localStorage.removeItem('gamaSchoolAdminRoute'); window.teacherRole = null; router.navigate('home'); return;
+                        }
+                        if (teacherSnap.exists() && teacherSnap.val().active !== false) {
+                            const lastActivity = Number(localStorage.getItem(GAMA_ADMIN_LAST_ACTIVITY_KEY) || 0);
+                            if (!lastActivity || Date.now() - lastActivity >= GAMA_ADMIN_IDLE_LIMIT) {
+                                await window.FB.signOut(window.auth); localStorage.removeItem(GAMA_ADMIN_LAST_ACTIVITY_KEY); router.navigate('home'); return;
+                            }
+                            window.teacherRole = { uid: user.uid, ...teacherSnap.val() };
+                            router.navigate('teacher-dashboard'); recordGamaAdminActivity(); return;
+                        }
+                    } catch (roleError) { console.warn('Gagal membaca peran guru:', roleError); }
+                }
                 // Jika Firebase mengembalikan sesi admin yang masih valid, pulihkan halaman terakhir.
                 if (user && !user.isAnonymous) {
                     const lastActivity = Number(localStorage.getItem(GAMA_ADMIN_LAST_ACTIVITY_KEY) || 0);
@@ -4280,7 +4869,7 @@
                     const allowedAdminRoutes = new Set([
                         'admin-dashboard', 'admin-classes', 'admin-students', 'admin-questions',
                         'admin-materials', 'admin-practice', 'admin-games', 'admin-results',
-                        'admin-exam-status', 'admin-integrity', 'admin-settings'
+                        'admin-exam-status', 'admin-integrity', 'admin-settings', 'admin-teachers'
                     ]);
                     if (savedRoute && allowedAdminRoutes.has(savedRoute.route)) {
                         router.navigate(savedRoute.route, savedRoute.params || {});
