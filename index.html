@@ -551,7 +551,17 @@
                         examTitle: settings.examTitle || 'Ulangan Harian',
                         examChapter: settings.examChapter || 'Belum dipilih',
                         examClassId: settings.examClassId || '',
-                        examClassName: settings.examClassName || ''
+                        examClassName: settings.examClassName || '',
+                        scheduleId: matchedSchedule ? Object.keys(schedules).find(id => schedules[id] === matchedSchedule) || '' : '',
+                        examConfig: matchedSchedule ? {
+                            examTitle: matchedSchedule.title || 'Ulangan Harian',
+                            examClassId: matchedSchedule.classId || '',
+                            examClassName: matchedSchedule.className || '',
+                            examChapter: matchedSchedule.chapter || '',
+                            examDuration: matchedSchedule.duration || 60,
+                            examToken: matchedSchedule.token || '',
+                            examActive: matchedSchedule.active !== false
+                        } : null
                     });
                 } catch (err) {
                     window.showLoading(false);
@@ -627,14 +637,22 @@
 
         async function createOrResumeExamSession(params) {
             const settingsSnap = await window.FB.get(window.FB.ref(window.db, 'settings'));
-            const settings = settingsSnap.exists() ? settingsSnap.val() : { examDuration: 60 };
+            const globalSettings = settingsSnap.exists() ? settingsSnap.val() : { examDuration: 60 };
+            // Jadwal terjadwal harus memakai konfigurasi jadwalnya sendiri, bukan pengaturan global admin.
+            const settings = params.examConfig ? { ...globalSettings, ...params.examConfig } : globalSettings;
+            const scheduleId = String(params.scheduleId || '');
 
             const sessionSnap = await window.FB.get(window.FB.ref(window.db, 'examSessions'));
             let existingSessionId = null;
             if (sessionSnap.exists()) {
                 Object.keys(sessionSnap.val()).forEach(sid => {
                     const x = sessionSnap.val()[sid];
-                    if (x.studentId === params.studentId && x.status === 'active') existingSessionId = sid;
+                    const sameSchedule = scheduleId
+                        ? String(x.scheduleId || '') === scheduleId
+                        : (!x.scheduleId && String(x.examTitle || '') === String(settings.examTitle || 'Ulangan Harian')
+                           && String(x.examChapter || '') === String(settings.examChapter || '')
+                           && String(x.examClassId || '') === String(settings.examClassId || ''));
+                    if (x.studentId === params.studentId && x.status === 'active' && sameSchedule) existingSessionId = sid;
                 });
             }
             if (existingSessionId) return existingSessionId;
@@ -643,9 +661,9 @@
             if (!qSnap.exists()) throw new Error("Bank soal belum tersedia.");
 
             const all = qSnap.val();
-            const selectedChapter = String(settings.examChapter || '').trim();
+            const selectedChapter = String(settings.examChapter || params.examChapter || '').trim();
             if (!selectedChapter) {
-                throw new Error('Guru belum memilih bab yang akan diujikan. Silakan pilih bab di Pengaturan.');
+                throw new Error('Bab ulangan belum dipilih. Periksa jadwal terjadwal atau Pengaturan Ulangan Admin.');
             }
 
             const activeQuestions = Object.keys(all)
@@ -701,6 +719,7 @@
 
             await window.FB.set(newSessRef, {
                 sessionId,
+                scheduleId,
                 studentId: params.studentId,
                 studentName: params.studentName,
                 nis: params.nis,
