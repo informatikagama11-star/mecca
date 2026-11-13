@@ -10,7 +10,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <!-- SheetJS / XLSX for Excel Import & Export -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+    <script defer src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script>
         tailwind.config = {
             theme: {
@@ -107,6 +107,21 @@
         window.db = database;
         window.auth = auth;
         window.FB = { ref, push, set, update, get, remove, onValue, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, signInAnonymously, setPersistence, browserLocalPersistence };
+
+        // Optimasi: kelola listener realtime berdasarkan halaman agar listener lama
+        // tidak terus berjalan setelah pengguna berpindah menu.
+        window.__gamaRouteUnsubs = window.__gamaRouteUnsubs || [];
+        window.__gamaStopRouteListeners = function() {
+            const list = window.__gamaRouteUnsubs.splice(0);
+            list.forEach(unsubscribe => { try { if (typeof unsubscribe === 'function') unsubscribe(); } catch (e) { console.warn('Gagal menghentikan listener lama:', e); } });
+        };
+        const originalOnValue = onValue;
+        window.FB.onValue = function(...args) {
+            const unsubscribe = originalOnValue(...args);
+            if (typeof unsubscribe === 'function') window.__gamaRouteUnsubs.push(unsubscribe);
+            return unsubscribe;
+        };
+
         window.firebaseConfig = firebaseConfig;
         window.teacherRole = null;
 
@@ -226,6 +241,8 @@
             currentRoute: 'home',
             params: {},
             navigate(route, params = {}) {
+                // Hentikan listener realtime milik halaman sebelumnya sebelum render ulang.
+                if (typeof window.__gamaStopRouteListeners === 'function') window.__gamaStopRouteListeners();
                 if (this.currentRoute === 'exam' && route !== 'exam') stopExamIntegrityMonitoring();
                 this.currentRoute = route;
                 this.params = params;
@@ -235,7 +252,7 @@
                     localStorage.setItem('gamaSchoolAdminRoute', JSON.stringify({ route, params }));
                 }
                 this.render();
-                window.scrollTo({ top: 0, behavior: 'smooth' });
+                window.scrollTo(0, 0);
             },
             render() {
                 const container = document.getElementById('app-container');
@@ -765,19 +782,46 @@
             document.getElementById('btn-start-exam').addEventListener('click', async () => {
                 window.showLoading(true, "Mempersiapkan ulangan...");
                 try {
-                    const resultSnap = await window.FB.get(window.FB.ref(window.db, 'examResults'));
-                    if (resultSnap.exists()) {
-                        const done = Object.values(resultSnap.val()).some(r =>
-                            r.studentId === params.studentId && r.status === 'completed'
-                        );
-                        if (done) {
-                            const found = Object.keys(resultSnap.val()).find(k => resultSnap.val()[k].studentId === params.studentId && resultSnap.val()[k].status === 'completed');
-                            if (found) {
-                                window.showLoading(false);
-                                router.navigate('result', { resultId: found });
-                                return;
-                            }
+                    // Cegah pengulangan hanya untuk sesi/jadwal yang sama.
+                    // Riwayat ulangan pada BAB atau jadwal lain tidak boleh memblokir siswa.
+                    const [resultSnap, sessionSnap] = await Promise.all([
+                        window.FB.get(window.FB.ref(window.db, 'examResults')),
+                        window.FB.get(window.FB.ref(window.db, 'examSessions'))
+                    ]);
+                    const results = resultSnap.exists() ? resultSnap.val() : {};
+                    const sessions = sessionSnap.exists() ? sessionSnap.val() : {};
+                    const targetScheduleId = String(params.scheduleId || '');
+                    const targetTitle = String(params.examConfig?.examTitle || params.examTitle || 'Ulangan Harian').trim().toLowerCase();
+                    const targetChapter = String(params.examConfig?.examChapter || params.examChapter || '').trim().toLowerCase();
+                    const targetClassId = String(params.examConfig?.examClassId || params.examClassId || '').trim();
+
+                    let matchingResultId = null;
+                    for (const [resultId, result] of Object.entries(results)) {
+                        if (!result || String(result.studentId || '') !== String(params.studentId) || result.status !== 'completed') continue;
+                        const linkedSession = result.sessionId ? sessions[result.sessionId] : null;
+                        const resultScheduleId = String(result.scheduleId || linkedSession?.scheduleId || '');
+                        let isSameExam = false;
+
+                        if (targetScheduleId) {
+                            // Jadwal terjadwal dikenali dari ID jadwal, bukan hanya NIS.
+                            isSameExam = resultScheduleId === targetScheduleId;
+                        } else {
+                            const resultTitle = String(result.examTitle || linkedSession?.examTitle || 'Ulangan Harian').trim().toLowerCase();
+                            const resultChapter = String(result.examChapter || linkedSession?.examChapter || '').trim().toLowerCase();
+                            const resultClassId = String(result.examClassId || linkedSession?.examClassId || result.classId || '').trim();
+                            isSameExam = !resultScheduleId &&
+                                resultTitle === targetTitle &&
+                                resultChapter === targetChapter &&
+                                (!targetClassId || !resultClassId || resultClassId === targetClassId);
                         }
+
+                        if (isSameExam) { matchingResultId = resultId; break; }
+                    }
+
+                    if (matchingResultId) {
+                        window.showLoading(false);
+                        router.navigate('result', { resultId: matchingResultId });
+                        return;
                     }
 
                     const sessionId = await createOrResumeExamSession(params);
@@ -1304,6 +1348,7 @@
                     studentId: sessData.studentId, studentName: sessData.studentName,
                     nis: sessData.nis, classId: sessData.classId, className: sessData.className,
                     examTitle: sessData.examTitle || 'Ulangan Harian', examChapter: sessData.examChapter || 'Belum ditentukan',
+                    scheduleId: sessData.scheduleId || '', examClassId: sessData.examClassId || '', examClassName: sessData.examClassName || '',
                     autoPoints, manualEarned, totalPoints: totalEarned,
                     maxPoints, finalScore, rawScore: finalScore, baseScore: finalScore,
                     confirmedIntegrityCount: 0, integrityDeduction: 0,
@@ -1947,9 +1992,9 @@
                     return;
                 }
                 const data = snapshot.val();
-                Object.keys(data).forEach(id => {
+                const rows = Object.keys(data).map(id => {
                     const c = data[id];
-                    tbody.innerHTML += `
+                    return `
                         <tr class="hover:bg-slate-50 transition">
                             <td class="py-4 px-6 font-bold text-slate-900">${c.name}</td>
                             <td class="py-4 px-6"><span class="px-2.5 py-1 rounded-full text-xs font-semibold ${c.active !== false ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}">${c.active !== false ? 'Aktif' : 'Nonaktif'}</span></td>
@@ -1961,6 +2006,7 @@
                         </tr>
                     `;
                 });
+                tbody.innerHTML = rows.join('');
             });
         }
 
